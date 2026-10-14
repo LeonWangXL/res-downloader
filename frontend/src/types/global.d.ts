@@ -4,6 +4,7 @@ interface Window {
     $message?: import('naive-ui').MessageProviderInst
     $notification?: import('naive-ui').NotificationProviderInst
     $baseUrl?: string
+ $sessionToken?: string
 }
 
 declare module '*.vue' {

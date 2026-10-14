@@ -1,7 +1,6 @@
 package core
 
 import (
-	"fmt"
 	"github.com/rs/zerolog"
 	"io"
 	"os"
@@ -22,15 +21,17 @@ func initLogger() *Logger {
 }
 
 func (l *Logger) Close() {
-	_ = l.logFile.Close()
+	if l.logFile != nil {
+		_ = l.logFile.Close()
+	}
 }
 
 func (l *Logger) Err(err error) {
-	l.Error().Stack().Err(err)
+	l.Error().Stack().Err(err).Msg("operation failed")
 }
 
 func (l *Logger) Esg(err error, format string, v ...interface{}) {
-	l.Error().Stack().Err(err).Msgf(fmt.Sprintf(format, v...))
+	l.Error().Stack().Err(err).Msgf(format, v...)
 }
 
 // NewLogger create a new logger

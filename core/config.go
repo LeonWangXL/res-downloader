@@ -2,10 +2,14 @@ package core
 
 import (
 	"encoding/json"
+	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -41,7 +45,8 @@ type Config struct {
 }
 
 var (
-	mimeMux sync.RWMutex
+	configMu       sync.RWMutex
+	configUpdateMu sync.Mutex
 )
 
 func initConfig() *Config {
@@ -63,7 +68,7 @@ func initConfig() *Config {
 		DownloadProxy: false,
 		AutoProxy:     false,
 		WxAction:      true,
-		TaskNumber:    runtime.NumCPU() * 2,
+		TaskNumber:    min(runtime.NumCPU()*2, 64),
 		DownNumber:    3,
 		UserAgent:     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
 		UseHeaders:    "default",
@@ -113,6 +118,10 @@ func initConfig() *Config {
 		globalLogger.Esg(err, "unmarshal merged config to struct failed")
 	}
 
+	if err := validateConfig(*globalConfig); err != nil {
+		globalLogger.Esg(err, "invalid cached settings, using defaults")
+		_ = json.Unmarshal(rawDefaults, globalConfig)
+	}
 	return globalConfig
 }
 
@@ -206,51 +215,82 @@ func getDefaultDownloadDir() string {
 	return ""
 }
 
-func (c *Config) setConfig(config Config) {
-	oldProxy := c.UpstreamProxy
-	openProxy := c.OpenProxy
-	oldRule := c.Rule
-	c.Host = config.Host
-	c.Port = config.Port
-	c.Theme = config.Theme
-	c.Locale = config.Locale
-	c.Quality = config.Quality
-	c.SaveDirectory = config.SaveDirectory
-	c.FilenameLen = config.FilenameLen
-	c.FilenameTime = config.FilenameTime
-	c.UpstreamProxy = config.UpstreamProxy
-	c.UserAgent = config.UserAgent
-	c.OpenProxy = config.OpenProxy
-	c.DownloadProxy = config.DownloadProxy
-	c.AutoProxy = config.AutoProxy
-	c.TaskNumber = config.TaskNumber
-	c.DownNumber = config.DownNumber
-	c.WxAction = config.WxAction
-	c.UseHeaders = config.UseHeaders
-	c.InsertTail = config.InsertTail
-	c.Rule = config.Rule
-	if oldProxy != c.UpstreamProxy || openProxy != c.OpenProxy {
-		proxyOnce.setTransport()
+func configSnapshot() Config {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	if globalConfig == nil {
+		return Config{UseHeaders: "default", TaskNumber: 4, DownNumber: 3, Rule: "*"}
 	}
+	result := *globalConfig
+	result.MimeMap = make(map[string]MimeInfo, len(globalConfig.MimeMap))
+	for k, v := range globalConfig.MimeMap {
+		result.MimeMap[k] = v
+	}
+	return result
+}
 
-	if oldRule != c.Rule {
-		err := ruleOnce.Load(c.Rule)
-		if err != nil {
-			globalLogger.Esg(err, "set rule failed")
+func validateConfig(c Config) error {
+	if c.Host != "127.0.0.1" && c.Host != "localhost" && c.Host != "0.0.0.0" && c.Host != "::1" {
+		return fmt.Errorf("listen host must be loopback or 0.0.0.0")
+	}
+	port, err := strconv.Atoi(c.Port)
+	if err != nil || port < 1025 || port > 65534 {
+		return fmt.Errorf("invalid port")
+	}
+	if c.Quality < 0 || c.Quality > 4 || c.TaskNumber < 1 || c.TaskNumber > 64 || c.DownNumber < 1 || c.DownNumber > 10 || c.FilenameLen < 0 || c.FilenameLen > 9999 {
+		return fmt.Errorf("invalid download settings")
+	}
+	if c.UpstreamProxy != "" {
+		u, err := url.Parse(c.UpstreamProxy)
+		if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https" && u.Scheme != "socks5") {
+			return fmt.Errorf("invalid upstream proxy")
+		}
+		if (u.Hostname() == "localhost" || net.ParseIP(u.Hostname()).IsLoopback()) && (u.Port() == c.Port || (httpServerOnce != nil && u.Port() == httpServerOnce.Port)) {
+			return fmt.Errorf("upstream proxy cannot point to this application")
 		}
 	}
-
-	mimeMux.Lock()
-	c.MimeMap = config.MimeMap
-	mimeMux.Unlock()
-
-	jsonData, err := json.Marshal(c)
-	if err == nil {
-		_ = globalConfig.storage.Store(jsonData)
+	for mime, item := range c.MimeMap {
+		if !strings.Contains(mime, "/") || item.Type == "" || (item.Suffix != "default" && (len(item.Suffix) < 2 || item.Suffix[0] != '.' || strings.ContainsAny(item.Suffix, `/\:<>|?*`))) {
+			return fmt.Errorf("invalid MIME mapping: %s", mime)
+		}
 	}
+	rules := &RuleSet{}
+	return rules.Load(c.Rule)
+}
+
+func (c *Config) setConfig(config Config) error {
+	configUpdateMu.Lock()
+	defer configUpdateMu.Unlock()
+	if err := validateConfig(config); err != nil {
+		return err
+	}
+	config.storage = c.storage
+	data, err := json.Marshal(config)
+	if err != nil {
+		return err
+	}
+	if err = c.storage.Store(data); err != nil {
+		return err
+	}
+	// The listener address belongs to the next launch. Keep current API routing stable.
+	configMu.Lock()
+	*c = config
+	configMu.Unlock()
+	if ruleOnce != nil {
+		if err := ruleOnce.Load(config.Rule); err != nil {
+			return err
+		}
+	}
+	if resourceOnce != nil {
+		resourceOnce.updateResTypes(config.MimeMap)
+		resourceOnce.schedule()
+	}
+	return nil
 }
 
 func (c *Config) getConfig(key string) interface{} {
+	snapshot := configSnapshot()
+	c = &snapshot
 	switch key {
 	case "Host":
 		return c.Host
@@ -289,8 +329,6 @@ func (c *Config) getConfig(key string) interface{} {
 	case "InsertTail":
 		return c.InsertTail
 	case "MimeMap":
-		mimeMux.RLock()
-		defer mimeMux.RUnlock()
 		return c.MimeMap
 	case "Rule":
 		return c.Rule
@@ -300,8 +338,8 @@ func (c *Config) getConfig(key string) interface{} {
 }
 
 func (c *Config) typeSuffix(mime string) (string, string) {
-	mimeMux.RLock()
-	defer mimeMux.RUnlock()
+	snapshot := configSnapshot()
+	c = &snapshot
 	mime = strings.ToLower(strings.Split(mime, ";")[0])
 	if v, ok := c.MimeMap[mime]; ok {
 		return v.Type, v.Suffix

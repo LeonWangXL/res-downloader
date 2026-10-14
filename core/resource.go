@@ -1,6 +1,7 @@
 package core
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -11,27 +12,29 @@ import (
 	"path/filepath"
 	"regexp"
 	"res-downloader/core/shared"
-	"strconv"
 	"strings"
 	"sync"
+	"time"
 )
 
-type WxFileDecodeResult struct {
-	SavePath string
-	Message  string
-}
-
 type Resource struct {
-	mediaMark  sync.Map
-	tasks      sync.Map
-	resType    map[string]bool
-	resTypeMux sync.RWMutex
+	mediaMark    sync.Map
+	previewMedia sync.Map
+	previewKeys  sync.Map
+	taskMu       sync.Mutex
+	jobs         map[string]*resourceJob
+	queue        []*resourceJob
+	active       int
+	closing      bool
+	workers      sync.WaitGroup
+	resType      map[string]bool
+	resTypeMux   sync.RWMutex
 }
 
 func initResource() *Resource {
 	if resourceOnce == nil {
-		resourceOnce = &Resource{}
-		resourceOnce.resType = resourceOnce.buildResType(globalConfig.MimeMap)
+		resourceOnce = &Resource{jobs: make(map[string]*resourceJob)}
+		resourceOnce.resType = resourceOnce.buildResType(configSnapshot().MimeMap)
 	}
 	return resourceOnce
 }
@@ -55,8 +58,9 @@ func (r *Resource) mediaIsMarked(key string) bool {
 	return loaded
 }
 
-func (r *Resource) markMedia(key string) {
-	r.mediaMark.Store(key, true)
+func (r *Resource) markMedia(key string) bool {
+	_, loaded := r.mediaMark.LoadOrStore(key, true)
+	return !loaded
 }
 
 func (r *Resource) getResType(key string) (bool, bool) {
@@ -81,103 +85,234 @@ func (r *Resource) setResType(n []string) {
 }
 
 func (r *Resource) clear() {
-	r.mediaMark.Clear()
+	r.mediaMark.Range(func(key, value interface{}) bool { r.mediaMark.Delete(key); return true })
+	r.previewMedia.Range(func(key, value interface{}) bool { r.previewMedia.Delete(key); return true })
+	r.previewKeys.Range(func(key, value interface{}) bool { r.previewKeys.Delete(key); return true })
 }
 
 func (r *Resource) delete(sign string) {
 	r.mediaMark.Delete(sign)
+	r.previewMedia.Range(func(key, value interface{}) bool {
+		if info, ok := value.(shared.MediaInfo); ok && info.UrlSign == sign {
+			r.previewMedia.Delete(key)
+			r.previewKeys.Delete(key)
+		}
+		return true
+	})
 }
 
-func (r *Resource) cancel(id string) error {
-	if d, ok := r.tasks.Load(id); ok {
-		d.(*FileDownloader).Cancel()
-		r.tasks.Delete(id) // 可选：取消后清理
-		return nil
+type resourceJob struct {
+	media              shared.MediaInfo
+	downloader         *FileDownloader
+	decodeStr          string
+	running, cancelled bool
+	done               chan struct{}
+}
+
+func (r *Resource) download(media shared.MediaInfo, decodeStr string) error {
+	cfg := configSnapshot()
+	if cfg.SaveDirectory == "" {
+		return errors.New("download directory is empty")
 	}
-	return errors.New("task not found")
+	if media.Id == "" || len(media.Id) > 256 {
+		return errors.New("invalid resource ID")
+	}
+	parsed, err := url.Parse(media.Url)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		return errors.New("invalid resource URL")
+	}
+	if media.Classify == "live" || media.Classify == "m3u8" {
+		return errors.New("stream downloads are not supported")
+	}
+	if media.Suffix == "default" {
+		media.Suffix = ".bin"
+	}
+	if media.Suffix == "" || !strings.HasPrefix(media.Suffix, ".") || strings.ContainsAny(media.Suffix, `/\:<>|?*`) {
+		return errors.New("invalid resource suffix")
+	}
+	if decodeStr != "" {
+		decoded, err := base64.StdEncoding.DecodeString(decodeStr)
+		if err != nil || len(decoded) > 1024*1024 {
+			return errors.New("invalid decryption data")
+		}
+	}
+	name := shared.GetFileNameFromURL(media.Url)
+	if name == "" {
+		name = shared.Md5(media.Url)
+	}
+	if media.Description != "" {
+		name = regexp.MustCompile(`[^\w\p{Han}]`).ReplaceAllString(media.Description, "")
+		length := cfg.FilenameLen
+		if length <= 0 {
+			length = 10
+		}
+		chars := []rune(name)
+		if len(chars) > length {
+			name = string(chars[:length])
+		}
+		if name == "" {
+			name = shared.Md5(media.Url)
+		}
+	}
+	if cfg.FilenameTime {
+		name += "_" + shared.GetCurrentDateTimeFormatted()
+	}
+	if !strings.HasSuffix(name, media.Suffix) {
+		name += media.Suffix
+	}
+	media.SavePath = filepath.Join(cfg.SaveDirectory, name)
+	if parsed.Hostname() == "qq.com" || strings.HasSuffix(parsed.Hostname(), ".qq.com") {
+		query := parsed.Query()
+		if cfg.Quality == 1 && query.Has("encfilekey") && query.Has("token") {
+			query = url.Values{"encfilekey": {query.Get("encfilekey")}, "token": {query.Get("token")}}
+		} else if cfg.Quality > 1 && media.OtherData["wx_file_formats"] != "" {
+			formats := strings.Split(media.OtherData["wx_file_formats"], "#")
+			quality := []string{formats[0], formats[len(formats)/2], formats[len(formats)-1]}
+			query.Set("X-snsvideoflag", quality[cfg.Quality-2])
+		}
+		parsed.RawQuery = query.Encode()
+	}
+	headers, err := r.parseHeaders(media)
+	if err != nil {
+		return err
+	}
+	fd := NewFileDownloader(parsed.String(), media.SavePath, cfg.TaskNumber, headers)
+	fd.config = cfg
+	job := &resourceJob{media: media, downloader: fd, decodeStr: decodeStr, done: make(chan struct{})}
+	job.media.Status = "pending"
+	fd.progressCallback = func(downloaded, total float64, _ int, _ float64) {
+		r.emitProgress(job, progressMessage(downloaded, total), shared.DownloadStatusRunning)
+	}
+	r.taskMu.Lock()
+	defer r.taskMu.Unlock()
+	if r.closing {
+		return errors.New("application is closing")
+	}
+	if r.jobs == nil {
+		r.jobs = make(map[string]*resourceJob)
+	}
+	for _, existing := range r.jobs {
+		if existing.media.Id == media.Id || existing.media.Url == media.Url {
+			return errors.New("resource is already queued or downloading")
+		}
+	}
+	if len(r.jobs) >= 1000 {
+		return errors.New("download queue is full")
+	}
+	r.jobs[media.Id] = job
+	r.queue = append(r.queue, job)
+	r.progressEventsEmit(job.media, "queued", "pending")
+	r.scheduleLocked(cfg.DownNumber)
+	return nil
 }
-
-func (r *Resource) download(mediaInfo shared.MediaInfo, decodeStr string) {
-	if globalConfig.SaveDirectory == "" {
+func (r *Resource) schedule() {
+	r.taskMu.Lock()
+	defer r.taskMu.Unlock()
+	r.scheduleLocked(configSnapshot().DownNumber)
+}
+func (r *Resource) scheduleLocked(limit int) {
+	if limit < 1 {
+		limit = 1
+	}
+	for !r.closing && r.active < limit && len(r.queue) > 0 {
+		job := r.queue[0]
+		r.queue = r.queue[1:]
+		job.running = true
+		job.media.Status = shared.DownloadStatusRunning
+		r.active++
+		r.workers.Add(1)
+		r.progressEventsEmit(job.media, "starting", shared.DownloadStatusRunning)
+		go r.runJob(job)
+	}
+}
+func (r *Resource) runJob(job *resourceJob) {
+	defer r.workers.Done()
+	err := job.downloader.Start()
+	if err == nil && job.decodeStr != "" {
+		r.emitProgress(job, "decrypting in progress", shared.DownloadStatusRunning)
+		err = r.decodeWxFile(job.downloader.FileName, job.decodeStr)
+	}
+	r.taskMu.Lock()
+	defer r.taskMu.Unlock()
+	job.media.SavePath = job.downloader.FileName
+	if job.cancelled || errors.Is(err, context.Canceled) {
+		job.media.SavePath = ""
+		r.progressEventsEmit(job.media, "cancelled", shared.DownloadStatusReady)
+	} else if err != nil {
+		r.progressEventsEmit(job.media, err.Error(), shared.DownloadStatusError)
+	} else {
+		r.progressEventsEmit(job.media, "complete", shared.DownloadStatusDone)
+	}
+	delete(r.jobs, job.media.Id)
+	r.active--
+	close(job.done)
+	r.scheduleLocked(configSnapshot().DownNumber)
+}
+func (r *Resource) emitProgress(job *resourceJob, message, status string) {
+	r.taskMu.Lock()
+	defer r.taskMu.Unlock()
+	if job.cancelled {
 		return
 	}
-	go func(mediaInfo shared.MediaInfo) {
-		rawUrl := mediaInfo.Url
-		fileName := shared.Md5(rawUrl)
-
-		if v := shared.GetFileNameFromURL(rawUrl); v != "" {
-			fileName = v
-		}
-
-		if mediaInfo.Description != "" {
-			fileName = regexp.MustCompile(`[^\w\p{Han}]`).ReplaceAllString(mediaInfo.Description, "")
-			fileLen := globalConfig.FilenameLen
-			if fileLen <= 0 {
-				fileLen = 10
-			}
-
-			runes := []rune(fileName)
-			if len(runes) > fileLen {
-				fileName = string(runes[:fileLen])
+	r.progressEventsEmit(job.media, message, status)
+}
+func (r *Resource) cancel(id string) error {
+	r.taskMu.Lock()
+	job, ok := r.jobs[id]
+	if !ok {
+		r.taskMu.Unlock()
+		return errors.New("task not found")
+	}
+	job.cancelled = true
+	job.downloader.Cancel()
+	if !job.running {
+		for i, item := range r.queue {
+			if item == job {
+				r.queue = append(r.queue[:i], r.queue[i+1:]...)
+				break
 			}
 		}
-
-		if globalConfig.FilenameTime {
-			mediaInfo.SavePath = filepath.Join(globalConfig.SaveDirectory, fileName+"_"+shared.GetCurrentDateTimeFormatted())
-		} else {
-			mediaInfo.SavePath = filepath.Join(globalConfig.SaveDirectory, fileName)
-		}
-
-		if !strings.HasSuffix(mediaInfo.SavePath, mediaInfo.Suffix) {
-			mediaInfo.SavePath = mediaInfo.SavePath + mediaInfo.Suffix
-		}
-
-		if strings.Contains(rawUrl, "qq.com") {
-			if globalConfig.Quality == 1 &&
-				strings.Contains(rawUrl, "encfilekey=") &&
-				strings.Contains(rawUrl, "token=") {
-				parseUrl, err := url.Parse(rawUrl)
-				queryParams := parseUrl.Query()
-				if err == nil && queryParams.Has("encfilekey") && queryParams.Has("token") {
-					rawUrl = parseUrl.Scheme + "://" + parseUrl.Host + "/" + parseUrl.Path +
-						"?encfilekey=" + queryParams.Get("encfilekey") +
-						"&token=" + queryParams.Get("token")
-				}
-			} else if globalConfig.Quality > 1 && mediaInfo.OtherData["wx_file_formats"] != "" {
-				format := strings.Split(mediaInfo.OtherData["wx_file_formats"], "#")
-				qualityMap := []string{
-					format[0],
-					format[len(format)/2],
-					format[len(format)-1],
-				}
-				rawUrl += "&X-snsvideoflag=" + qualityMap[globalConfig.Quality-2]
-			}
-		}
-
-		headers, _ := r.parseHeaders(mediaInfo)
-
-		downloader := NewFileDownloader(rawUrl, mediaInfo.SavePath, globalConfig.TaskNumber, headers)
-		downloader.progressCallback = func(totalDownloaded, totalSize float64, taskID int, taskProgress float64) {
-			r.progressEventsEmit(mediaInfo, strconv.Itoa(int(totalDownloaded*100/totalSize))+"%", shared.DownloadStatusRunning)
-		}
-		r.tasks.Store(mediaInfo.Id, downloader)
-		err := downloader.Start()
-		mediaInfo.SavePath = downloader.FileName
-		if err != nil {
-			if !strings.Contains(err.Error(), "cancelled") {
-				r.progressEventsEmit(mediaInfo, err.Error())
-			}
-			return
-		}
-		if decodeStr != "" {
-			r.progressEventsEmit(mediaInfo, "decrypting in progress", shared.DownloadStatusRunning)
-			if err := r.decodeWxFile(mediaInfo.SavePath, decodeStr); err != nil {
-				r.progressEventsEmit(mediaInfo, "decryption error: "+err.Error())
-				return
-			}
-		}
-		r.progressEventsEmit(mediaInfo, "complete", shared.DownloadStatusDone)
-	}(mediaInfo)
+		delete(r.jobs, id)
+		job.media.SavePath = ""
+		r.progressEventsEmit(job.media, "cancelled", shared.DownloadStatusReady)
+		close(job.done)
+	}
+	r.taskMu.Unlock()
+	select {
+	case <-job.done:
+		return nil
+	case <-time.After(35 * time.Second):
+		return errors.New("cancellation is still pending")
+	}
+}
+func (r *Resource) taskSnapshot() []shared.MediaInfo {
+	r.taskMu.Lock()
+	defer r.taskMu.Unlock()
+	items := make([]shared.MediaInfo, 0, len(r.jobs))
+	for _, job := range r.jobs {
+		items = append(items, job.media)
+	}
+	return items
+}
+func (r *Resource) shutdown() {
+	r.taskMu.Lock()
+	r.closing = true
+	for _, job := range r.jobs {
+		job.cancelled = true
+		job.downloader.Cancel()
+	}
+	r.queue = nil
+	r.taskMu.Unlock()
+	r.workers.Wait()
+}
+func (r *Resource) updateResTypes(mime map[string]MimeInfo) {
+	r.resTypeMux.Lock()
+	defer r.resTypeMux.Unlock()
+	next := r.buildResType(mime)
+	for key := range next {
+		next[key] = r.resType[key]
+	}
+	r.resType = next
 }
 
 func (r *Resource) parseHeaders(mediaInfo shared.MediaInfo) (map[string]string, error) {
@@ -205,22 +340,33 @@ func (r *Resource) wxFileDecode(mediaInfo shared.MediaInfo, fileName, decodeStr 
 		return "", err
 	}
 	defer sourceFile.Close()
-	mediaInfo.SavePath = strings.ReplaceAll(fileName, ".mp4", "_decrypt.mp4")
+	mediaInfo.SavePath = strings.TrimSuffix(fileName, filepath.Ext(fileName)) + "_decrypt.mp4"
+	mediaInfo.SavePath = shared.GetUniqueFileName(mediaInfo.SavePath)
 
-	destinationFile, err := os.Create(mediaInfo.SavePath)
+	destinationFile, err := os.OpenFile(mediaInfo.SavePath, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
 	if err != nil {
 		return "", err
 	}
 	defer destinationFile.Close()
+	success := false
+	defer func() {
+		if !success {
+			os.Remove(mediaInfo.SavePath)
+		}
+	}()
 
 	_, err = io.Copy(destinationFile, sourceFile)
 	if err != nil {
+		return "", err
+	}
+	if err := destinationFile.Close(); err != nil {
 		return "", err
 	}
 	err = r.decodeWxFile(mediaInfo.SavePath, decodeStr)
 	if err != nil {
 		return "", err
 	}
+	success = true
 	return mediaInfo.SavePath, nil
 }
 
@@ -263,7 +409,7 @@ func (r *Resource) decodeWxFile(fileName, decodeStr string) error {
 	}
 
 	if n < byteCount {
-		byteCount = n
+		return io.ErrUnexpectedEOF
 	}
 
 	xorResult := make([]byte, byteCount)

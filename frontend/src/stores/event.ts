@@ -8,7 +8,8 @@ export const useEventStore = defineStore('ws-store', () => {
 
     const init = () => {
         EventsOn("event", (res: any) => {
-            const data = JSON.parse(res)
+            let data:any
+            try {data=JSON.parse(res)} catch {return}
             if (handles.value.hasOwnProperty(data.type)) {
                 handles.value[data.type](data.data)
             } else {
@@ -22,6 +23,6 @@ export const useEventStore = defineStore('ws-store', () => {
     }
 
     return {
-        init, addHandle
+        init, addHandle, removeHandle:(type:string)=>{delete handles.value[type]}
     }
 })

@@ -2,17 +2,21 @@ package core
 
 import (
 	"bytes"
+	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
 	"res-downloader/core/shared"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 )
@@ -25,7 +29,11 @@ type ResponseData struct {
 	Data    interface{} `json:"data"`
 }
 
-type HttpServer struct{}
+type HttpServer struct {
+	Host, Port    string
+	server        *http.Server
+	previewClient *http.Client
+}
 
 func initHttpServer() *HttpServer {
 	if httpServerOnce == nil {
@@ -34,22 +42,49 @@ func initHttpServer() *HttpServer {
 	return httpServerOnce
 }
 
-func (h *HttpServer) run() {
-	listener, err := net.Listen("tcp", globalConfig.Host+":"+globalConfig.Port)
+func (h *HttpServer) start() error {
+	cfg := configSnapshot()
+	h.Host, h.Port = cfg.Host, cfg.Port
+	listener, err := net.Listen("tcp", net.JoinHostPort(h.Host, h.Port))
 	if err != nil {
-		globalLogger.Err(err)
-		log.Fatalf("Service cannot start: %v", err)
+		return fmt.Errorf("local service cannot listen on %s: %w", listenerAddress(h), err)
 	}
-	fmt.Println("Service started, listening http://" + globalConfig.Host + ":" + globalConfig.Port)
-	if err1 := http.Serve(listener, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Host == "127.0.0.1:"+globalConfig.Port && HandleApi(w, r) {
-
-		} else {
-			proxyOnce.Proxy.ServeHTTP(w, r) // 代理
+	h.previewClient = (&FileDownloader{}).buildClient()
+	h.previewClient.Transport.(*http.Transport).Proxy = func(r *http.Request) (*url.URL, error) {
+		cfg := configSnapshot()
+		if cfg.DownloadProxy && cfg.UpstreamProxy != "" {
+			return url.Parse(cfg.UpstreamProxy)
 		}
-	})); err1 != nil {
-		globalLogger.Err(err1)
-		fmt.Printf("Service startup exception: %v", err1)
+		return nil, nil
+	}
+	h.server = &http.Server{ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host, port, err := net.SplitHostPort(r.Host)
+		isLocal := err == nil && port == h.Port && (host == "localhost" || net.ParseIP(host).IsLoopback())
+		if isLocal && HandleApi(w, r) {
+			return
+		}
+		if isLocal {
+			http.NotFound(w, r)
+			return
+		}
+		proxyOnce.Proxy.ServeHTTP(w, r)
+	})}
+	go func() {
+		if err := h.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			globalLogger.Esg(err, "local service stopped")
+		}
+	}()
+	return nil
+}
+func listenerAddress(h *HttpServer) string { return net.JoinHostPort(h.Host, h.Port) }
+func (h *HttpServer) stop() {
+	if h.server != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		defer cancel()
+		_ = h.server.Shutdown(ctx)
+	}
+	if h.previewClient != nil {
+		h.previewClient.CloseIdleConnections()
 	}
 }
 
@@ -68,31 +103,53 @@ func (h *HttpServer) preview(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Missing 'url' parameter", http.StatusBadRequest)
 		return
 	}
-	realURL, _ = url.QueryUnescape(realURL)
 	parsedURL, err := url.Parse(realURL)
-	if err != nil {
+	if err != nil || (parsedURL.Scheme != "http" && parsedURL.Scheme != "https") || parsedURL.Host == "" {
 		http.Error(w, "Invalid URL", http.StatusBadRequest)
 		return
 	}
-	request, err := http.NewRequest("GET", parsedURL.String(), nil)
-	if err != nil {
-		http.Error(w, "Failed to fetch the resource", http.StatusInternalServerError)
-		return
-	}
-
-	if rangeHeader := r.Header.Get("Range"); rangeHeader != "" {
-		request.Header.Set("Range", rangeHeader)
-	}
-
-	resp, err := http.DefaultClient.Do(request)
+	resp, err := h.fetchPreview(r.Context(), realURL, r.Header.Get("Range"))
 	if err != nil {
 		http.Error(w, "Failed to fetch the resource", http.StatusInternalServerError)
 		return
 	}
 	defer resp.Body.Close()
+	if key, ok := resourceOnce.previewKeys.Load(realURL); ok && (resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusPartialContent) {
+		offset := int64(0)
+		if resp.StatusCode == http.StatusPartialContent {
+			rangeValue := strings.TrimPrefix(resp.Header.Get("Content-Range"), "bytes ")
+			offset, err = strconv.ParseInt(strings.SplitN(rangeValue, "-", 2)[0], 10, 64)
+			if err != nil || offset < 0 {
+				http.Error(w, "Invalid encrypted preview range", http.StatusBadGateway)
+				return
+			}
+		}
+		resp.Body = &previewDecryptReader{ReadCloser: resp.Body, key: key.([]byte), offset: offset}
+		resp.Header.Set("Cache-Control", "no-store")
+		resp.Header.Del("ETag")
+		resp.Header.Del("Content-MD5")
+		resp.Header.Set("Content-Type", "video/mp4")
+	}
+	// A playlist's relative segments and keys must use the same authenticated proxy.
+	if resp.StatusCode == http.StatusOK && (strings.HasSuffix(strings.ToLower(resp.Request.URL.Path), ".m3u8") || strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "mpegurl")) {
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 2*1024*1024+1))
+		if err != nil || len(body) > 2*1024*1024 {
+			http.Error(w, "Failed to read playlist", http.StatusBadGateway)
+			return
+		}
+		body, err = h.rewritePlaylist(body, resp.Request.URL, realURL)
+		if err != nil {
+			http.Error(w, "Invalid playlist URL", http.StatusBadGateway)
+			return
+		}
+		w.Header().Set("Content-Type", "application/vnd.apple.mpegurl")
+		w.Header().Set("Cache-Control", "no-store")
+		w.Write(body)
+		return
+	}
 
 	for k, v := range resp.Header {
-		if strings.ToLower(k) == "access-control-allow-origin" {
+		if strings.HasPrefix(strings.ToLower(k), "access-control-") || strings.EqualFold(k, "Connection") || strings.EqualFold(k, "Transfer-Encoding") {
 			continue
 		}
 		for _, vv := range v {
@@ -103,9 +160,171 @@ func (h *HttpServer) preview(w http.ResponseWriter, r *http.Request) {
 
 	_, err = io.Copy(w, resp.Body)
 	if err != nil {
-		http.Error(w, "Failed to serve the resource", http.StatusInternalServerError)
+		globalLogger.Esg(err, "serve preview")
 	}
 	return
+}
+
+func (h *HttpServer) preparePreview(w http.ResponseWriter, r *http.Request) {
+	var data struct {
+		shared.MediaInfo
+		DecodeStr string `json:"decodeStr"`
+		Check     bool   `json:"check"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&data); err != nil {
+		h.error(w, "Invalid preview source")
+		return
+	}
+	parsed, err := url.Parse(data.Url)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		h.error(w, "Invalid preview URL")
+		return
+	}
+	var key []byte
+	if data.DecodeStr != "" {
+		key, err = base64.StdEncoding.DecodeString(data.DecodeStr)
+		if err != nil || len(key) != 131072 {
+			h.error(w, "Invalid preview key")
+			return
+		}
+	}
+	// Preserve freshly captured login headers; restored history can supply its remaining headers.
+	if _, loaded := resourceOnce.previewMedia.Load(data.Url); !loaded {
+		resourceOnce.previewMedia.Store(data.Url, data.MediaInfo)
+	}
+	if key != nil {
+		resourceOnce.previewKeys.Store(data.Url, key)
+	} else {
+		resourceOnce.previewKeys.Delete(data.Url)
+	}
+	if data.Check {
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		resp, err := h.fetchPreview(ctx, data.Url, "bytes=0-4095")
+		if err != nil {
+			h.error(w, "Preview connection failed", respData{"reason": "network"})
+			return
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+			h.error(w, "Preview upstream rejected request", respData{"reason": "http", "status": resp.StatusCode})
+			return
+		}
+		if resp.StatusCode == http.StatusPartialContent && !strings.HasPrefix(resp.Header.Get("Content-Range"), "bytes 0-") {
+			h.error(w, "Preview returned wrong range", respData{"reason": "range"})
+			return
+		}
+		body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		if err != nil || len(body) == 0 {
+			h.error(w, "Preview read failed", respData{"reason": "network"})
+			return
+		}
+		text := strings.ToLower(strings.TrimSpace(string(body)))
+		if strings.HasPrefix(text, "<!doctype html") || strings.HasPrefix(text, "<html") || strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/html") {
+			h.error(w, "Preview returned a webpage", respData{"reason": "non_media"})
+			return
+		}
+		if key != nil {
+			if mp4Prefix(body) {
+				// Some CDN variants already return plaintext despite carrying a decode key.
+				resourceOnce.previewKeys.Delete(data.Url)
+			} else {
+				for i := 0; i < len(body) && i < len(key); i++ {
+					body[i] ^= key[i]
+				}
+				if !mp4Prefix(body) {
+					h.error(w, "Preview decryption failed", respData{"reason": "decrypt"})
+					return
+				}
+			}
+		}
+		h.success(w, respData{"status": resp.StatusCode, "contentType": resp.Header.Get("Content-Type")})
+		return
+	}
+	h.success(w)
+}
+
+func mp4Prefix(body []byte) bool {
+	if len(body) < 8 {
+		return false
+	}
+	switch string(body[4:8]) {
+	case "ftyp", "styp", "moof":
+		return true
+	}
+	return false
+}
+
+type previewDecryptReader struct {
+	io.ReadCloser
+	key    []byte
+	offset int64
+}
+
+func (r *previewDecryptReader) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	for i := 0; i < n && r.offset+int64(i) < int64(len(r.key)); i++ {
+		p[i] ^= r.key[r.offset+int64(i)]
+	}
+	r.offset += int64(n)
+	return n, err
+}
+
+func (h *HttpServer) rewritePlaylist(body []byte, base *url.URL, source string) ([]byte, error) {
+	localURL := func(raw string) (string, error) {
+		relative, err := url.Parse(raw)
+		if err != nil {
+			return "", err
+		}
+		absolute := base.ResolveReference(relative)
+		if absolute.Scheme != "http" && absolute.Scheme != "https" {
+			return "", fmt.Errorf("unsupported playlist scheme")
+		}
+		if info, ok := resourceOnce.previewMedia.Load(source); ok {
+			media := info.(shared.MediaInfo)
+			media.Url = absolute.String()
+			resourceOnce.previewMedia.Store(media.Url, media)
+		}
+		return "http://" + net.JoinHostPort(h.Host, h.Port) + "/api/preview?" + url.Values{"url": {absolute.String()}, "token": {appOnce.SessionToken}}.Encode(), nil
+	}
+	lines := strings.Split(string(body), "\n")
+	for i, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if !strings.HasPrefix(line, "#") {
+			rewritten, err := localURL(line)
+			if err != nil {
+				return nil, err
+			}
+			lines[i] = rewritten
+		} else {
+			// HLS URI attributes include encryption keys, maps and alternate renditions.
+			const marker = `URI="`
+			cursor := 0
+			for {
+				start := strings.Index(line[cursor:], marker)
+				if start < 0 {
+					break
+				}
+				start += cursor + len(marker)
+				end := strings.Index(line[start:], `"`)
+				if end < 0 {
+					return nil, fmt.Errorf("unterminated playlist URI")
+				}
+				end += start
+				rewritten, err := localURL(line[start:end])
+				if err != nil {
+					return nil, err
+				}
+				line = line[:start] + rewritten + line[end:]
+				cursor = start + len(rewritten) + 1
+			}
+			lines[i] = line
+		}
+	}
+	return []byte(strings.Join(lines, "\n")), nil
 }
 
 func (h *HttpServer) send(t string, data interface{}) {
@@ -117,7 +336,14 @@ func (h *HttpServer) send(t string, data interface{}) {
 		fmt.Println("Error converting map to JSON:", err)
 		return
 	}
-	runtime.EventsEmit(appOnce.ctx, "event", string(jsonData))
+	if t == "newResources" {
+		if info, ok := data.(shared.MediaInfo); ok {
+			resourceOnce.previewMedia.Store(info.Url, info)
+		}
+	}
+	if appOnce != nil && appOnce.ctx != nil {
+		runtime.EventsEmit(appOnce.ctx, "event", string(jsonData))
+	}
 }
 
 func (h *HttpServer) writeJson(w http.ResponseWriter, data *ResponseData) {
@@ -202,7 +428,8 @@ func (h *HttpServer) openFolder(w http.ResponseWriter, r *http.Request) {
 		FilePath string `json:"filePath"`
 	}
 	err := json.NewDecoder(r.Body).Decode(&data)
-	if err == nil && data.FilePath == "" {
+	if err != nil || data.FilePath == "" {
+		h.error(w, "invalid file path")
 		return
 	}
 
@@ -219,7 +446,7 @@ func (h *HttpServer) openFolder(w http.ResponseWriter, r *http.Request) {
 func (h *HttpServer) install(w http.ResponseWriter, r *http.Request) {
 	if appOnce.isInstall() {
 		h.success(w, respData{
-			"isPass": systemOnce.Password == "",
+			"isPass": systemOnce.password() == "",
 		})
 		return
 	}
@@ -227,13 +454,13 @@ func (h *HttpServer) install(w http.ResponseWriter, r *http.Request) {
 	out, err := appOnce.installCert()
 	if err != nil {
 		h.error(w, err.Error()+"\n"+out, respData{
-			"isPass": systemOnce.Password == "",
+			"isPass": systemOnce.password() == "",
 		})
 		return
 	}
 
 	h.success(w, respData{
-		"isPass": systemOnce.Password == "",
+		"isPass": systemOnce.password() == "",
 	})
 }
 
@@ -255,12 +482,12 @@ func (h *HttpServer) openSystemProxy(w http.ResponseWriter, r *http.Request) {
 	err := appOnce.OpenSystemProxy()
 	if err != nil {
 		h.error(w, err.Error(), respData{
-			"value": appOnce.IsProxy,
+			"value": appOnce.proxyEnabled(),
 		})
 		return
 	}
 	h.success(w, respData{
-		"value": appOnce.IsProxy,
+		"value": appOnce.proxyEnabled(),
 	})
 }
 
@@ -268,27 +495,27 @@ func (h *HttpServer) unsetSystemProxy(w http.ResponseWriter, r *http.Request) {
 	err := appOnce.UnsetSystemProxy()
 	if err != nil {
 		h.error(w, err.Error(), respData{
-			"value": appOnce.IsProxy,
+			"value": appOnce.proxyEnabled(),
 		})
 		return
 	}
 	h.success(w, respData{
-		"value": appOnce.IsProxy,
+		"value": appOnce.proxyEnabled(),
 	})
 }
 
 func (h *HttpServer) isProxy(w http.ResponseWriter, r *http.Request) {
 	h.success(w, respData{
-		"value": appOnce.IsProxy,
+		"value": appOnce.proxyEnabled(),
 	})
 }
 
 func (h *HttpServer) appInfo(w http.ResponseWriter, r *http.Request) {
-	h.success(w, appOnce)
+	h.success(w, respData{"AppName": appOnce.AppName, "Version": appOnce.Version, "IsProxy": appOnce.proxyEnabled()})
 }
 
 func (h *HttpServer) getConfig(w http.ResponseWriter, r *http.Request) {
-	h.success(w, globalConfig)
+	h.success(w, configSnapshot())
 }
 
 func (h *HttpServer) setConfig(w http.ResponseWriter, r *http.Request) {
@@ -297,7 +524,10 @@ func (h *HttpServer) setConfig(w http.ResponseWriter, r *http.Request) {
 		h.error(w, err.Error())
 		return
 	}
-	globalConfig.setConfig(data)
+	if err := globalConfig.setConfig(data); err != nil {
+		h.error(w, err.Error())
+		return
+	}
 	h.success(w)
 }
 
@@ -344,7 +574,10 @@ func (h *HttpServer) download(w http.ResponseWriter, r *http.Request) {
 		h.error(w, err.Error())
 		return
 	}
-	resourceOnce.download(data.MediaInfo, data.DecodeStr)
+	if err := resourceOnce.download(data.MediaInfo, data.DecodeStr); err != nil {
+		h.error(w, err.Error())
+		return
+	}
 	h.success(w)
 }
 
@@ -394,7 +627,7 @@ func (h *HttpServer) batchExport(w http.ResponseWriter, r *http.Request) {
 		h.error(w, err.Error())
 		return
 	}
-	fileName := filepath.Join(globalConfig.SaveDirectory, "res-downloader-"+shared.GetCurrentDateTimeFormatted()+".txt")
+	fileName := filepath.Join(configSnapshot().SaveDirectory, "res-downloader-"+shared.GetCurrentDateTimeFormatted()+".txt")
 	err := os.WriteFile(fileName, []byte(data.Content), 0644)
 	if err != nil {
 		h.error(w, err.Error())
@@ -405,4 +638,38 @@ func (h *HttpServer) batchExport(w http.ResponseWriter, r *http.Request) {
 	h.success(w, respData{
 		"file_name": fileName,
 	})
+}
+
+func (h *HttpServer) tasks(w http.ResponseWriter, r *http.Request) {
+	h.success(w, resourceOnce.taskSnapshot())
+}
+
+func (h *HttpServer) fetchPreview(ctx context.Context, realURL, rangeHeader string) (*http.Response, error) {
+	parsedURL, err := url.Parse(realURL)
+	if err != nil {
+		return nil, err
+	}
+	request, err := http.NewRequestWithContext(ctx, "GET", realURL, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	if rangeHeader != "" {
+		request.Header.Set("Range", rangeHeader)
+	}
+
+	if info, ok := resourceOnce.previewMedia.Load(realURL); ok {
+		headers, err := resourceOnce.parseHeaders(info.(shared.MediaInfo))
+		if err == nil {
+			fd := NewFileDownloader(realURL, "", 1, headers)
+			fd.setHeaders(request)
+		}
+	}
+	if request.Header.Get("User-Agent") == "" {
+		request.Header.Set("User-Agent", configSnapshot().UserAgent)
+	}
+	if request.Header.Get("Referer") == "" {
+		request.Header.Set("Referer", parsedURL.Scheme+"://"+parsedURL.Host+"/")
+	}
+	return h.previewClient.Do(request)
 }

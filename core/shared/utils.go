@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"golang.org/x/net/publicsuffix"
+	"net"
 	"net/url"
 	"os"
 	"os/exec"
@@ -39,6 +40,10 @@ func GetTopLevelDomain(rawURL string) string {
 	if err == nil && u.Host != "" {
 		rawURL = u.Host
 	}
+	if host, _, err := net.SplitHostPort(rawURL); err == nil {
+		rawURL = host
+	}
+	rawURL = strings.Trim(rawURL, "[]")
 	domain, err := publicsuffix.EffectiveTLDPlusOne(rawURL)
 	if err != nil {
 		return rawURL
@@ -159,5 +164,8 @@ func OpenFolder(filePath string) error {
 		return errors.New("unsupported platform")
 	}
 
+	if sysRuntime.GOOS == "linux" {
+		return nil
+	}
 	return cmd.Start()
 }

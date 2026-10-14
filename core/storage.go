@@ -2,7 +2,7 @@ package core
 
 import (
 	"os"
-	"path"
+	"path/filepath"
 	"res-downloader/core/shared"
 )
 
@@ -13,7 +13,7 @@ type Storage struct {
 
 func NewStorage(filename string, def []byte) *Storage {
 	return &Storage{
-		fileName: path.Join(appOnce.UserDir, filename),
+		fileName: filepath.Join(appOnce.UserDir, filename),
 		def:      def,
 	}
 }
@@ -33,9 +33,26 @@ func (l *Storage) Load() ([]byte, error) {
 	return d, err
 }
 
-func (l *Storage) Store(data []byte) error {
-	if err := os.WriteFile(l.fileName, data, 0644); err != nil {
+func (l *Storage) Store(data []byte) error { return atomicWriteFile(l.fileName, data, 0600) }
+
+func atomicWriteFile(filename string, data []byte, mode os.FileMode) (err error) {
+	file, err := os.CreateTemp(filepath.Dir(filename), ".resd-store-*")
+	if err != nil {
 		return err
 	}
-	return nil
+	temp := file.Name()
+	defer func() { file.Close(); os.Remove(temp) }()
+	if err = file.Chmod(mode); err != nil {
+		return err
+	}
+	if _, err = file.Write(data); err != nil {
+		return err
+	}
+	if err = file.Sync(); err != nil {
+		return err
+	}
+	if err = file.Close(); err != nil {
+		return err
+	}
+	return os.Rename(temp, filename)
 }

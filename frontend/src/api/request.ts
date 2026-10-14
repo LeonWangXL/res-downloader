@@ -1,5 +1,6 @@
 import type {AxiosResponse, InternalAxiosRequestConfig} from 'axios'
 import axios from 'axios'
+import {shouldAttachSessionToken} from './session'
 
 interface RequestOptions {
     url: string
@@ -15,6 +16,9 @@ const instance = axios.create({
 
 instance.interceptors.request.use(
     (config: InternalAxiosRequestConfig<any>) => {
+        if(shouldAttachSessionToken(config.url || '/',window.$baseUrl)) {
+            config.headers.set("X-Resd-Token",window.$sessionToken || "")
+        }
         return config
     },
     (error) => {

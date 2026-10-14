@@ -9,12 +9,15 @@ import (
 	"github.com/wailsapp/wails/v2/pkg/options/mac"
 	"github.com/wailsapp/wails/v2/pkg/options/windows"
 	"log"
+	"os"
+	"path/filepath"
 	"res-downloader/core"
 	"runtime"
 
 	"github.com/wailsapp/wails/v2"
 	"github.com/wailsapp/wails/v2/pkg/options"
 	"github.com/wailsapp/wails/v2/pkg/options/assetserver"
+	wailsruntime "github.com/wailsapp/wails/v2/pkg/runtime"
 )
 
 //go:embed all:frontend/dist
@@ -42,6 +45,7 @@ func main() {
 	// Create application with options
 	err := wails.Run(&options.App{
 		Title:                    app.AppName,
+		SingleInstanceLock:       &options.SingleInstanceLock{UniqueId: "d5da932e-87b1-43b7-9f4f-39ae5e7e4563", OnSecondInstanceLaunch: func(_ options.SecondInstanceData) { app.ShowWindow() }},
 		Width:                    1280,
 		MinWidth:                 960,
 		Height:                   800,
@@ -66,6 +70,7 @@ func main() {
 			fmt.Println("lockfile:", app.LockFile)
 			app.Startup(ctx)
 		},
+		OnDomReady: func(ctx context.Context) { wailsruntime.WindowShow(ctx) },
 		OnShutdown: func(ctx context.Context) {
 			app.OnExit()
 		},
@@ -84,6 +89,7 @@ func main() {
 		},
 		Windows: &windows.Options{
 			WebviewIsTransparent:              false,
+			WebviewUserDataPath:               isolatedWebviewPath(),
 			WindowIsTranslucent:               false,
 			DisableFramelessWindowDecorations: false,
 		},
@@ -98,4 +104,11 @@ func main() {
 	if err != nil {
 		println("Error:", err.Error())
 	}
+}
+
+func isolatedWebviewPath() string {
+	if directory := os.Getenv("RESD_CONFIG_DIR"); directory != "" {
+		return filepath.Join(directory, "webview")
+	}
+	return ""
 }

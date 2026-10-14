@@ -4,12 +4,12 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
+	"fmt"
 	"net"
 	"net/http"
 	"net/url"
 	"res-downloader/core/plugins"
 	"res-downloader/core/shared"
-	"strings"
 	"time"
 
 	"github.com/elazarl/goproxy"
@@ -42,9 +42,7 @@ func init() {
 		MediaIsMarked: func(key string) bool {
 			return resourceOnce.mediaIsMarked(key)
 		},
-		MarkMedia: func(key string) {
-			resourceOnce.markMedia(key)
-		},
+		MarkMedia: func(key string) bool { return resourceOnce.markMedia(key) },
 		GetConfig: func(key string) interface{} {
 			return globalConfig.getConfig(key)
 		},
@@ -110,27 +108,29 @@ func (p *Proxy) setCa() error {
 
 func (p *Proxy) setTransport() {
 	transport := &http.Transport{
-		DisableKeepAlives: false,
-		// MaxIdleConnsPerHost: 10,
-		DialContext: (&net.Dialer{
-			Timeout: 60 * time.Second,
-		}).DialContext,
-		TLSHandshakeTimeout:   60 * time.Second,
-		ResponseHeaderTimeout: 60 * time.Second,
-		IdleConnTimeout:       30 * time.Second,
-	}
-
-	p.Proxy.ConnectDial = nil
-	p.Proxy.ConnectDialWithReq = nil
-
-	if globalConfig.UpstreamProxy != "" && globalConfig.OpenProxy && !strings.Contains(globalConfig.UpstreamProxy, globalConfig.Port) {
-		proxyURL, err := url.Parse(globalConfig.UpstreamProxy)
-		if err == nil {
-			transport.Proxy = http.ProxyURL(proxyURL)
-			p.Proxy.ConnectDial = p.Proxy.NewConnectDialToProxy(globalConfig.UpstreamProxy)
-		}
+		DialContext:         (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		TLSHandshakeTimeout: 30 * time.Second, ResponseHeaderTimeout: 30 * time.Second, IdleConnTimeout: 30 * time.Second,
+		Proxy: func(r *http.Request) (*url.URL, error) {
+			cfg := configSnapshot()
+			if cfg.OpenProxy && cfg.UpstreamProxy != "" {
+				return url.Parse(cfg.UpstreamProxy)
+			}
+			return nil, nil
+		},
 	}
 	p.Proxy.Tr = transport
+	p.Proxy.ConnectDial = nil
+	p.Proxy.ConnectDialWithReq = func(req *http.Request, network, addr string) (net.Conn, error) {
+		cfg := configSnapshot()
+		if cfg.OpenProxy && cfg.UpstreamProxy != "" {
+			dial := p.Proxy.NewConnectDialToProxy(cfg.UpstreamProxy)
+			if dial == nil {
+				return nil, fmt.Errorf("unsupported CONNECT upstream proxy")
+			}
+			return dial(network, addr)
+		}
+		return (&net.Dialer{Timeout: 30 * time.Second}).DialContext(req.Context(), network, addr)
+	}
 }
 
 func (p *Proxy) matchPlugin(host string) shared.Plugin {

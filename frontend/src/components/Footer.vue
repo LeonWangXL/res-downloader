@@ -59,7 +59,7 @@ const store = useIndexStore()
 const props = defineProps(["showModal"])
 const emits = defineEmits(["update:showModal"])
 const certUrl = computed(()=>{
-  return store.baseUrl + "/api/cert"
+  return store.baseUrl + "/api/cert?token=" + encodeURIComponent(window.$sessionToken || "")
 })
 const changeShow = (value: boolean) => {
   emits('update:showModal', value)

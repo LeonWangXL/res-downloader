@@ -1,3 +1,7 @@
+## 验证与修复记录
+
+Windows 可运行根目录 `build.cmd`，或 `scripts/verify.ps1 -Build`。详细说明见 [升级修复与验证](../docs/upgrade-verification.md)。Wails CLI 应使用 v2.12.0，与 go.mod 保持一致。
+
 ## Mac
 ```bash
 wails build -platform "darwin/universal"

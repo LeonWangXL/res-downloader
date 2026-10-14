@@ -10,7 +10,7 @@ type Bridge struct {
 	GetResType    func(key string) (bool, bool)
 	TypeSuffix    func(mime string) (string, string)
 	MediaIsMarked func(key string) bool
-	MarkMedia     func(key string)
+	MarkMedia     func(key string) bool
 	GetConfig     func(key string) interface{}
 	Send          func(t string, data interface{})
 }

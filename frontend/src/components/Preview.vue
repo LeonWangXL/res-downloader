@@ -1,203 +1,87 @@
 <template>
-  <NModal
-      style="--wails-draggable:no-drag"
-      :show="showModal"
-      :on-update:show="changeShow"
-      preset="card"
-      class="w-[540px] h-auto"
-      :title="t('index.preview')"
-      display-directive="show"
-      :on-after-enter="onAfterEnter"
-      :on-after-leave="onAfterLeave"
-  >
-    <div class="flex justify-center w-full h-[80vh]">
-      <video
-          class="video-js vjs-default-skin w-full h-full"
-          ref="videoPlayer"
-          controls
-          preload="auto"
-      ></video>
-    </div>
-  </NModal>
+  <div class="inline-media-player">
+    <div ref="videoHost" class="video-player-host" />
+    <p v-if="errorMessage" class="preview-error" role="alert">{{ errorMessage }}</p>
+    <button v-if="errorMessage" class="preview-retry" @click="start">{{ t('workspace.preview_retry') }}</button>
+  </div>
 </template>
-
 <script setup lang="ts">
-import { ref} from "vue"
-import "video.js/dist/video-js.css"
-import videojs from "video.js"
-import flvjs from "flv.js"
-import axios from "axios"
-// @ts-ignore
-import { getDecryptionArray } from '@/assets/js/decrypt.js'
-import type Player from "video.js/dist/types/player"
+import {ref, watch, nextTick, onUnmounted, onDeactivated} from 'vue'
+import videojs from 'video.js'
+import type Player from 'video.js/dist/types/player'
+import 'video.js/dist/video-js.css'
+import flvjs from 'flv.js'
 import {useI18n} from 'vue-i18n'
+import appApi from '@/api/app'
+// @ts-ignore
+import {getDecryptionArray} from '@/assets/js/decrypt.js'
+import {previewURL, encryptedPreviewSource, previewContentType} from '@/resourcePresentation'
 
+const props = defineProps<{showModal: boolean, previewRow: any}>()
 const {t} = useI18n()
-const videoPlayer = ref<HTMLElement | any>(null)
+const videoHost = ref<HTMLElement | null>(null)
+const errorMessage = ref('')
+let video: HTMLVideoElement | null = null
 let player: Player | null = null
 let flvPlayer: flvjs.Player | null = null
-let sourceBuffer: SourceBuffer | null = null
-let isLoading = false
-let isOver = false
-let startByte = 0
-const chunkSize = 5 * 1024 * 1024
-let endByte = startByte + chunkSize - 1
-let decodeArr: any = null
-let mediaSource: MediaSource
-let rowUrl = ''
-
-const props = defineProps<{
-  showModal: boolean
-  previewRow: any
-}>()
-const emits = defineEmits(["update:showModal"])
-
-const changeShow = (value: boolean) => emits("update:showModal", value)
-
-const onAfterEnter = () => {
-  if (props.previewRow.DecodeKey) {
-    playVideoWithoutTotalLength()
-  } else if (props.previewRow.Classify === "live") {
-    playFlvStream()
-  } else {
-    setupVideoJsPlayer()
-  }
+let generation = 0
+function cleanup() {
+  generation++
+  flvPlayer?.destroy(); flvPlayer = null
+  player?.dispose(); player = null
+  if(video) { video.pause(); video.removeAttribute('src'); video.load() }
+  video = null
+  videoHost.value?.replaceChildren()
 }
-
-const onAfterLeave = () => {
-  if (props.previewRow.Classify === "live" && flvPlayer) {
-    flvPlayer.unload()
-    flvPlayer.detachMediaElement()
-    flvPlayer.destroy()
-    flvPlayer = null
-  } else if (player) {
-    player.pause()
-  }
-  if (startByte){
-    videoPlayer.value?.pause()
-    videoPlayer.value?.removeEventListener("seeking", handleSeeking)
-    videoPlayer.value?.removeEventListener("timeupdate", handleTimeupdate)
-  }
+function fail(error: unknown) {
+  console.error('Media preview failed:', error instanceof Error ? error.message : video?.error?.code || 'media error')
+  const code = player?.error()?.code || video?.error?.code
+  errorMessage.value = t(code === 2 ? 'workspace.preview_network' : code === 3 ? 'workspace.preview_decode' : code === 4 ? 'workspace.preview_unsupported' : 'workspace.preview_error')
 }
-
-const playFlvStream = () => {
+async function start() {
+  cleanup()
+  errorMessage.value = ''
+  const version = generation
+  await nextTick()
+  if(!props.showModal || !props.previewRow || !videoHost.value || version !== generation) return
+  const row = props.previewRow
+  const mediaURL = row.DecodeKey ? encryptedPreviewSource(row.Url) : row.Url
   try {
-    if (!flvjs.isSupported() || !videoPlayer.value) return
-
-    flvPlayer = flvjs.createPlayer({ type: "flv", url: window?.$baseUrl + "/api/preview?url=" + encodeURIComponent(props.previewRow.Url) })
-    flvPlayer.attachMediaElement(videoPlayer.value)
-    flvPlayer.load()
-    flvPlayer.play()
-  }catch (e) {
-
-  }
-}
-
-const setupVideoJsPlayer = () => {
-  if (!videoPlayer.value) return
-
-  if (!player) {
-    player = videojs(videoPlayer.value, {
-      controls: true,
-      autoplay: false,
-      preload: "auto",
-    })
-  }
-
-  player.src({
-    src: window?.$baseUrl + "/api/preview?url=" + encodeURIComponent(props.previewRow.Url),
-    type: props.previewRow.ContentType,
-    withCredentials: true,
-  })
-  player.play()
-}
-
-const playVideoWithoutTotalLength = () => {
-  rowUrl = window?.$baseUrl + "/api/preview?url=" + encodeURIComponent(buildUrlWithParams(props.previewRow.Url))
-  mediaSource = new MediaSource()
-  videoPlayer.value.src = URL.createObjectURL(mediaSource)
-  videoPlayer.value.play()
-  isOver = false
-  startByte = 0
-  endByte = startByte + chunkSize - 1
-  decodeArr = getDecryptionArray(props.previewRow.DecodeKey)
-  sourceBuffer = null
-  mediaSource.addEventListener("sourceopen", () => {
-    sourceBuffer = mediaSource.addSourceBuffer('video/mp4; codecs="avc1.42E01E, mp4a.40.2"')
-    downloadChunk()
-  })
-
-  videoPlayer.value.addEventListener("seeking", handleSeeking)
-  videoPlayer.value.addEventListener("timeupdate", handleTimeupdate)
-}
-
-const buildUrlWithParams = (url: string) => {
-  const parsedUrl = new URL(url)
-  const queryParams = parsedUrl.searchParams
-  if (queryParams.has("encfilekey") && queryParams.has("token")) {
-    return `${parsedUrl.origin}${parsedUrl.pathname}?encfilekey=${queryParams.get("encfilekey")}&token=${queryParams.get("token")}`
-  }
-  return url
-}
-
-const handleSeeking = () => {
-  const currentTime = videoPlayer.value.currentTime
-  const bufferedEnd = videoPlayer.value.buffered.end(videoPlayer.value.buffered.length - 1)
-
-  if (currentTime > bufferedEnd && !isLoading && !isOver) {
-    downloadChunk()
-  }
-}
-
-const handleTimeupdate = () => {
-  if (videoPlayer.value.buffered.length > 0) {
-    const bufferedEnd = videoPlayer.value.buffered.end(videoPlayer.value.buffered.length - 1);
-    const timeToEnd = bufferedEnd - videoPlayer.value.currentTime;
-
-    // 如果剩余播放时间不足10秒，加载更多数据
-    if (timeToEnd < 10 && !isLoading && !isOver) {
-      downloadChunk()
+    let decodeStr = ''
+    if(row.DecodeKey) {
+      const key: Uint8Array = getDecryptionArray(row.DecodeKey)
+      // Encode only the prefix key; the full video stays streamed by the local service.
+      decodeStr = btoa(Array.from(key, byte => String.fromCharCode(byte)).join(''))
     }
-  }
+    const result = await appApi.preparePreview({...row, Url: mediaURL, decodeStr, check: row.Classify !== 'live'})
+    if(version !== generation) return
+    if(result.code !== 1) {
+      const reasons: Record<string,string> = {network: 'preview_network', http: 'preview_http', range: 'preview_range', non_media: 'preview_non_media', decrypt: 'preview_decrypt'}
+      errorMessage.value = t(`workspace.${reasons[result.data?.reason] || 'preview_error'}`, {status: result.data?.status})
+      return
+    }
+    video = document.createElement('video')
+    video.className = 'video-js vjs-default-skin'
+    video.controls = true
+    video.setAttribute('playsinline', '')
+    videoHost.value!.appendChild(video)
+    const sourceURL = previewURL(mediaURL, window.$baseUrl, window.$sessionToken)
+    if(row.Classify === 'live' && /flv/i.test(row.ContentType)) {
+      if(!flvjs.isSupported()) throw new Error('FLV unavailable')
+      flvPlayer = flvjs.createPlayer({type: 'flv', url: sourceURL})
+      flvPlayer.attachMediaElement(video)
+      flvPlayer.on(flvjs.Events.ERROR, fail)
+      flvPlayer.load()
+      flvPlayer.play()?.catch(fail)
+    } else {
+      player = videojs(video, {controls: true, autoplay: false, preload: 'metadata', fluid: false})
+      player.on('error', fail)
+      player.src({src: sourceURL, type: previewContentType(row), withCredentials: true})
+      player.play()?.catch(() => {})
+    }
+  } catch(error) { if(version === generation) fail(error) }
 }
-
-const downloadChunk = () => {
-  if (sourceBuffer?.updating) return;
-
-  isLoading = true
-  try {
-    axios.get(rowUrl, { headers: { Range: `bytes=${startByte}-${endByte}` }, responseType: "arraybuffer" })
-        .then(response => {
-          let chunk = new Uint8Array(response.data)
-
-          // 解密前 13702 字节
-          for (let i = 0; i < chunk.byteLength && startByte + i < decodeArr.length; i++) {
-            chunk[i] ^= decodeArr[startByte + i]
-          }
-
-          // 更新字节范围，准备请求下一个分片
-          startByte = endByte + 1
-          endByte = startByte + chunkSize - 1
-
-          if (sourceBuffer && !sourceBuffer.updating) {
-            sourceBuffer.appendBuffer(chunk);
-          } else {
-            console.error("SourceBuffer is updating, cannot append buffer right now.");
-          }
-          isLoading = false
-          if (response.data.byteLength === 0) {
-            isOver = true
-            mediaSource?.endOfStream()
-          }
-        })
-        .catch(() => {
-          isLoading = false
-          isOver = true
-        })
-  }catch (e) {
-    isLoading = false
-    isOver = true
-  }
-}
-
+watch(() => [props.showModal, props.previewRow?.Id, props.previewRow?.Url], start, {immediate: true, flush: 'post'})
+onDeactivated(cleanup)
+onUnmounted(cleanup)
 </script>

@@ -1,6 +1,8 @@
 import request from '@/api/request'
 
 export default {
+    preparePreview(data: object) { return request({url:'/api/preview-prepare',method:'post',data}) },
+    tasks() { return request({url:"/api/tasks",method:"post"}) },
     install() {
         return request({
             url: '/api/install',

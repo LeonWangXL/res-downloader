@@ -1,5 +1,7 @@
 <template>
-  <div class="h-full relative p-5 overflow-y-auto [&::-webkit-scrollbar]:hidden" :key="renderKey">
+  <div class="settings-page" :key="renderKey">
+    <h1 class="settings-heading">{{ t("menu.setting") }}</h1>
+    <NButton type="primary" class="mb-3" :loading="saving" @click="saveConfig">{{ t("common.submit") }}</NButton>
     <NTabs type="line" animated>
       <NTabPane name="basic" :tab="t('setting.basic_setting')">
         <NForm
@@ -264,31 +266,23 @@ const renderKey = ref(999)
 const hostValidationFeedback = ref("")
 const portValidationFeedback = ref("")
 
-watch(formValue.value, () => {
-  formValue.value.Port = formValue.value.Port.trim()
-  formValue.value.Host = formValue.value.Host.trim()
-
-  if (!isValidHost(formValue.value.Host)) {
-    hostValidationFeedback.value = t("setting.host_format_error")
-    return
-  } else {
-    hostValidationFeedback.value = ''
-  }
-
-  if (!isValidPort(parseInt(formValue.value.Port))) {
-    portValidationFeedback.value = t("setting.port_format_error")
-    return
-  } else {
-    portValidationFeedback.value = ''
-  }
-  store.setConfig(formValue.value)
-}, {deep: true})
-
-watch(MimeMap, () => {
-  store.setConfig({
-    MimeMap: JSON.parse(MimeMap.value)
-  })
-})
+const saving=ref(false)
+const saveConfig=async () => {
+  formValue.value.Port=formValue.value.Port.trim()
+  formValue.value.Host=formValue.value.Host.trim()
+  if(!isValidHost(formValue.value.Host)){hostValidationFeedback.value=t("setting.host_format_error");return}
+  hostValidationFeedback.value=''
+  if(!/^\d+$/.test(formValue.value.Port) || !isValidPort(Number(formValue.value.Port))){portValidationFeedback.value=t("setting.port_format_error");return}
+  portValidationFeedback.value=''
+  saving.value=true
+  try {
+    const parsed=JSON.parse(MimeMap.value)
+    if(!parsed || Array.isArray(parsed) || typeof parsed!=='object') throw new Error('Invalid MIME map')
+    await store.setConfig({...formValue.value,MimeMap:parsed})
+    window.$message?.success(t("common.submit"))
+  } catch(error) { window.$message?.error(String(error)) }
+  finally { saving.value=false }
+}
 
 watch(() => {
   return store.globalConfig.Theme
@@ -304,7 +298,7 @@ watch(() => store.globalConfig.Locale, () => {
 const selectDir = () => {
   appApi.openDirectoryDialog().then((res: any) => {
     if (res.code === 1) {
-      formValue.value.SaveDirectory = res.data.folder
+      if(res.data.folder) formValue.value.SaveDirectory = res.data.folder
     }
   }).catch((err: any) => {
     window?.$message?.error(err)

@@ -4,9 +4,11 @@ package core
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 )
 
@@ -29,9 +31,10 @@ func (s *SystemSetup) runCommand(args []string, sudo bool) ([]byte, error) {
 	}
 
 	var cmd *exec.Cmd
-	if s.Password != "" && sudo {
+	password := s.password()
+	if password != "" && sudo {
 		cmd = exec.Command("sudo", append([]string{"-S"}, args...)...)
-		cmd.Stdin = bytes.NewReader([]byte(s.Password + "\n"))
+		cmd.Stdin = bytes.NewReader([]byte(password + "\n"))
 	} else {
 		cmd = exec.Command(args[0], args[1:]...)
 	}
@@ -40,41 +43,82 @@ func (s *SystemSetup) runCommand(args []string, sudo bool) ([]byte, error) {
 	return output, err
 }
 
-func (s *SystemSetup) setProxy() error {
-	commands := [][]string{
-		{"gsettings", "set", "org.gnome.system.proxy", "mode", "manual"},
-		{"gsettings", "set", "org.gnome.system.proxy.http", "host", "127.0.0.1"},
-		{"gsettings", "set", "org.gnome.system.proxy.http", "port", globalConfig.Port},
-		{"gsettings", "set", "org.gnome.system.proxy.https", "host", "127.0.0.1"},
-		{"gsettings", "set", "org.gnome.system.proxy.https", "port", globalConfig.Port},
-	}
-
-	isSuccess := false
-	var errs strings.Builder
-
-	for _, cmd := range commands {
-		if output, err := s.runCommand(cmd, false); err != nil {
-			errs.WriteString(fmt.Sprintf("cmd: %v\noutput: %s\nerr: %s\n", cmd, output, err))
-		} else {
-			isSuccess = true
-		}
-	}
-
-	if isSuccess {
-		return nil
-	}
-
-	return fmt.Errorf("failed to set proxy:\n%s", errs.String())
+type linuxProxyBackup struct {
+	Values map[string]string
+	Port   string
 }
 
-func (s *SystemSetup) unsetProxy() error {
-	cmd := []string{"gsettings", "set", "org.gnome.system.proxy", "mode", "none"}
-	output, err := s.runCommand(cmd, false)
-	if err != nil {
-		return fmt.Errorf("failed to unset proxy: %s\noutput: %s", err.Error(), string(output))
+var linuxProxyKeys = [][2]string{{"org.gnome.system.proxy", "mode"}, {"org.gnome.system.proxy.http", "host"}, {"org.gnome.system.proxy.http", "port"}, {"org.gnome.system.proxy.https", "host"}, {"org.gnome.system.proxy.https", "port"}}
+
+func proxyBackupPath() string { return filepath.Join(appOnce.UserDir, "proxy-backup.json") }
+func (s *SystemSetup) setProxy() error {
+	if err := s.recoverProxy(); err != nil {
+		return err
+	}
+	backup := linuxProxyBackup{Values: map[string]string{}, Port: httpServerOnce.Port}
+	for _, key := range linuxProxyKeys {
+		out, err := s.runCommand([]string{"gsettings", "get", key[0], key[1]}, false)
+		if err != nil {
+			return fmt.Errorf("read proxy: %s: %w", out, err)
+		}
+		backup.Values[key[0]+"/"+key[1]] = strings.TrimSpace(string(out))
+	}
+	data, _ := json.Marshal(backup)
+	if err := atomicWriteFile(proxyBackupPath(), data, 0600); err != nil {
+		return err
+	}
+	values := []string{"'manual'", "'127.0.0.1'", backup.Port, "'127.0.0.1'", backup.Port}
+	// Enable manual mode last, after both endpoints are configured.
+	for _, i := range []int{1, 2, 3, 4, 0} {
+		key := linuxProxyKeys[i]
+		if out, err := s.runCommand([]string{"gsettings", "set", key[0], key[1], values[i]}, false); err != nil {
+			_ = s.restoreLinuxProxy(backup)
+			return fmt.Errorf("set proxy: %s: %w", out, err)
+		}
 	}
 	return nil
 }
+func (s *SystemSetup) restoreLinuxProxy(backup linuxProxyBackup) error {
+	for _, i := range []int{1, 2, 3, 4, 0} {
+		key := linuxProxyKeys[i]
+		value, ok := backup.Values[key[0]+"/"+key[1]]
+		if !ok {
+			return fmt.Errorf("invalid proxy backup")
+		}
+		if out, err := s.runCommand([]string{"gsettings", "set", key[0], key[1], value}, false); err != nil {
+			return fmt.Errorf("restore proxy: %s: %w", out, err)
+		}
+	}
+	return os.Remove(proxyBackupPath())
+}
+func (s *SystemSetup) unsetProxy() error {
+	data, err := os.ReadFile(proxyBackupPath())
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	var backup linuxProxyBackup
+	if err := json.Unmarshal(data, &backup); err != nil {
+		return err
+	}
+	for _, key := range linuxProxyKeys[1:] {
+		out, err := s.runCommand([]string{"gsettings", "get", key[0], key[1]}, false)
+		if err != nil {
+			return err
+		}
+		expected := backup.Port
+		if key[1] == "host" {
+			expected = "'127.0.0.1'"
+		}
+		if strings.TrimSpace(string(out)) != expected {
+			return os.Remove(proxyBackupPath())
+		}
+	}
+	return s.restoreLinuxProxy(backup)
+}
+func (s *SystemSetup) recoverProxy() error { return s.unsetProxy() }
 
 func (s *SystemSetup) installCert() (string, error) {
 	_, err := s.initCert()
@@ -95,48 +139,47 @@ func (s *SystemSetup) installCert() (string, error) {
 	case "deepin":
 		certDir := "/usr/share/ca-certificates/" + appOnce.AppName
 		certPath = certDir + "/" + certName
-		s.runCommand([]string{"mkdir", "-p", certDir}, true)
+		if out, err := s.runCommand([]string{"mkdir", "-p", certDir}, true); err != nil {
+			return string(out), err
+		}
 	case "arch":
-		certPath = "/usr/share/ca-certificates/trust-source/" + certName
+		certPath = "/etc/ca-certificates/trust-source/anchors/" + certName
+		if out, err := s.runCommand([]string{"mkdir", "-p", filepath.Dir(certPath)}, true); err != nil {
+			return string(out), err
+		}
 		updateCmd = []string{"update-ca-trust"}
 	default:
 		certPath = "/usr/local/share/ca-certificates/" + certName
 	}
 
-	var outs, errs strings.Builder
-	isSuccess := false
-
 	if output, err := s.runCommand([]string{"cp", "-f", s.CertFile, certPath}, true); err != nil {
-		errs.WriteString(fmt.Sprintf("copy cert failed: %s\n%s\n", err.Error(), output))
-	} else {
-		isSuccess = true
-		outs.Write(output)
+		return string(output), fmt.Errorf("copy certificate: %w", err)
 	}
-
 	if distro == "deepin" {
+		entry := appOnce.AppName + "/" + certName
 		confPath := "/etc/ca-certificates.conf"
-		checkCmd := []string{"grep", "-qxF", certName, confPath}
-		if _, err := s.runCommand(checkCmd, true); err != nil {
-			echoCmd := []string{"bash", "-c", fmt.Sprintf("echo '%s/%s' >> %s", appOnce.AppName, certName, confPath)}
-			if output, err := s.runCommand(echoCmd, true); err != nil {
-				errs.WriteString(fmt.Sprintf("append conf failed: %s\n%s\n", err.Error(), output))
-			} else {
-				isSuccess = true
-				outs.Write(output)
+		if _, err := s.runCommand([]string{"grep", "-qxF", entry, confPath}, true); err != nil {
+			if out, err := s.runCommand([]string{"bash", "-c", fmt.Sprintf("echo '%s' >> %s", entry, confPath)}, true); err != nil {
+				return string(out), err
 			}
 		}
 	}
-
-	if output, err := s.runCommand(updateCmd, true); err != nil {
-		errs.WriteString(fmt.Sprintf("update failed: %s\n%s\n", err.Error(), output))
-	} else {
-		isSuccess = true
-		outs.Write(output)
+	output, err := s.runCommand(updateCmd, true)
+	return string(output), err
+}
+func (s *SystemSetup) removeLegacyCert() error {
+	distro, err := s.getLinuxDistro()
+	if err != nil {
+		return err
 	}
-
-	if isSuccess {
-		return "", nil
+	if distro == "arch" {
+		oldPath := "/usr/share/ca-certificates/trust-source/" + appOnce.AppName + ".crt"
+		if out, err := s.runCommand([]string{"rm", "-f", oldPath}, true); err != nil {
+			return fmt.Errorf("remove old certificate: %s: %w", out, err)
+		}
+		if out, err := s.runCommand([]string{"update-ca-trust"}, true); err != nil {
+			return fmt.Errorf("refresh trust: %s: %w", out, err)
+		}
 	}
-
-	return outs.String(), fmt.Errorf("certificate installation failed:\n%s", errs.String())
+	return nil
 }

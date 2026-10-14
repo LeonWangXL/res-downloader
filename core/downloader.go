@@ -2,443 +2,407 @@ package core
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
-	"res-downloader/core/shared"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
 const (
-	MaxRetries  = 3               // 最大重试次数
-	RetryDelay  = 3 * time.Second // 重试延迟
-	MinPartSize = 1 * 1024 * 1024 // 最小分片大小（1MB）
+	MaxRetries  = 3
+	RetryDelay  = 3 * time.Second
+	MinPartSize = 1024 * 1024
 )
 
-type ProgressCallback func(totalDownloaded float64, totalSize float64, taskID int, taskProgress float64)
-
-type ProgressChan struct {
-	taskID int
-	bytes  int64
-}
-
+type ProgressCallback func(totalDownloaded, totalSize float64, taskID int, taskProgress float64)
 type DownloadTask struct {
-	taskID         int
-	rangeStart     int64
-	rangeEnd       int64
-	downloadedSize int64
-	isCompleted    bool
-	err            error
+	taskID                               int
+	rangeStart, rangeEnd, downloadedSize int64
 }
-
 type FileDownloader struct {
-	Url              string
-	Referer          string
-	ProxyUrl         *url.URL
-	FileName         string
-	File             *os.File
-	totalTasks       int
-	TotalSize        int64
-	IsMultiPart      bool
-	RetryOnError     bool
-	Headers          map[string]string
-	DownloadTaskList []*DownloadTask
-	progressCallback ProgressCallback
-	ctx              context.Context
-	cancelFunc       context.CancelFunc
+	Url, Referer, FileName string
+	ProxyUrl               *url.URL
+	File                   *os.File
+	TotalSize              int64
+	IsMultiPart            bool
+	totalTasks             int
+	Headers                map[string]string
+	DownloadTaskList       []*DownloadTask
+	progressCallback       ProgressCallback
+	ctx                    context.Context
+	cancelFunc             context.CancelFunc
+	config                 Config
+	client                 *http.Client
+	tempName               string
+	validator              string
+	downloaded             atomic.Int64
+	total                  atomic.Int64
 }
 
-func NewFileDownloader(url, filename string, totalTasks int, headers map[string]string) *FileDownloader {
-	ctx, cancelFunc := context.WithCancel(context.Background())
-	return &FileDownloader{
-		Url:              url,
-		FileName:         filename,
-		totalTasks:       totalTasks,
-		IsMultiPart:      false,
-		RetryOnError:     false,
-		TotalSize:        0,
-		Headers:          headers,
-		DownloadTaskList: make([]*DownloadTask, 0),
-		ctx:              ctx,
-		cancelFunc:       cancelFunc,
+func NewFileDownloader(rawURL, filename string, totalTasks int, headers map[string]string) *FileDownloader {
+	ctx, cancel := context.WithCancel(context.Background())
+	copyHeaders := make(map[string]string, len(headers))
+	for k, v := range headers {
+		copyHeaders[k] = v
 	}
+	fd := &FileDownloader{Url: rawURL, FileName: filename, totalTasks: totalTasks, Headers: copyHeaders, ctx: ctx, cancelFunc: cancel, config: configSnapshot(), TotalSize: -1}
+	fd.total.Store(-1)
+	return fd
 }
-
 func (fd *FileDownloader) buildClient() *http.Client {
-	transport := &http.Transport{
-		MaxIdleConnsPerHost: 100,
-		IdleConnTimeout:     90 * time.Second,
-	}
+	tr := &http.Transport{DialContext: (&net.Dialer{Timeout: 15 * time.Second, KeepAlive: 30 * time.Second}).DialContext, MaxIdleConnsPerHost: 16, IdleConnTimeout: 30 * time.Second, TLSHandshakeTimeout: 15 * time.Second, ResponseHeaderTimeout: 30 * time.Second, DisableCompression: true}
 	if fd.ProxyUrl != nil {
-		transport.Proxy = http.ProxyURL(fd.ProxyUrl)
+		tr.Proxy = http.ProxyURL(fd.ProxyUrl)
 	}
-	return &http.Client{
-		Transport: transport,
-	}
+	return &http.Client{Transport: tr}
 }
 
-var forbiddenDownloadHeaders = map[string]struct{}{
-	"accept-encoding":   {},
-	"content-length":    {},
-	"host":              {},
-	"connection":        {},
-	"keep-alive":        {},
-	"proxy-connection":  {},
-	"transfer-encoding": {},
+var forbiddenDownloadHeaders = map[string]bool{"accept-encoding": true, "content-length": true, "host": true, "connection": true, "keep-alive": true, "proxy-connection": true, "transfer-encoding": true, "range": true, "if-range": true, "if-none-match": true, "if-modified-since": true, "x-forwarded-for": true, "x-real-ip": true}
 
-	"sec-fetch-site":     {},
-	"sec-fetch-mode":     {},
-	"sec-fetch-dest":     {},
-	"sec-fetch-user":     {},
-	"sec-ch-ua":          {},
-	"sec-ch-ua-mobile":   {},
-	"sec-ch-ua-platform": {},
-
-	"if-none-match":     {},
-	"if-modified-since": {},
-
-	"x-forwarded-for": {},
-	"x-real-ip":       {},
-}
-
-func (fd *FileDownloader) setHeaders(request *http.Request) {
-	for key, value := range fd.Headers {
-		if globalConfig.UseHeaders == "default" {
-			lk := strings.ToLower(key)
-			if _, forbidden := forbiddenDownloadHeaders[lk]; forbidden {
-				continue
-			}
-			request.Header.Set(key, value)
+func (fd *FileDownloader) setHeaders(req *http.Request) {
+	allowed := map[string]bool{}
+	for _, name := range strings.Split(fd.config.UseHeaders, ",") {
+		allowed[strings.ToLower(strings.TrimSpace(name))] = true
+	}
+	for k, v := range fd.Headers {
+		name := strings.ToLower(k)
+		if forbiddenDownloadHeaders[name] || strings.HasPrefix(name, "sec-") {
 			continue
 		}
-		
-		if strings.Contains(globalConfig.UseHeaders, key) {
-			request.Header.Set(key, value)
+		if fd.config.UseHeaders == "default" || allowed[name] {
+			req.Header.Set(k, v)
 		}
 	}
+	req.Header.Set("Accept-Encoding", "identity")
 }
-
 func (fd *FileDownloader) init() error {
-	parsedURL, err := url.Parse(fd.Url)
-	if err != nil {
-		return fmt.Errorf("parse URL failed: %w", err)
+	u, err := url.Parse(fd.Url)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return errors.New("invalid download URL")
 	}
-	if parsedURL.Scheme != "" && parsedURL.Host != "" {
-		fd.Referer = parsedURL.Scheme + "://" + parsedURL.Host + "/"
-	}
-
-	if globalConfig.DownloadProxy && globalConfig.UpstreamProxy != "" && !strings.Contains(globalConfig.UpstreamProxy, globalConfig.Port) {
-		proxyURL, err := url.Parse(globalConfig.UpstreamProxy)
-		if err == nil {
-			fd.ProxyUrl = proxyURL
+	fd.Referer = u.Scheme + "://" + u.Host + "/"
+	if fd.config.DownloadProxy && fd.config.UpstreamProxy != "" {
+		fd.ProxyUrl, err = url.Parse(fd.config.UpstreamProxy)
+		if err != nil {
+			return err
 		}
 	}
-
-	request, err := http.NewRequest("HEAD", fd.Url, nil)
-	if err != nil {
-		return fmt.Errorf("create HEAD request failed: %w", err)
+	if fd.Headers["User-Agent"] == "" {
+		fd.Headers["User-Agent"] = fd.config.UserAgent
 	}
-
-	if _, ok := fd.Headers["User-Agent"]; !ok {
-		fd.Headers["User-Agent"] = globalConfig.UserAgent
-	}
-	if _, ok := fd.Headers["Referer"]; !ok {
+	if fd.Headers["Referer"] == "" {
 		fd.Headers["Referer"] = fd.Referer
 	}
-
-	fd.setHeaders(request)
-
-	var resp *http.Response
-	for retries := 0; retries < MaxRetries; retries++ {
-		resp, err = fd.buildClient().Do(request)
-		if err == nil {
-			break
-		}
-		if retries < MaxRetries-1 {
-			time.Sleep(RetryDelay)
-			globalLogger.Warn().Msgf("HEAD request failed, retrying (%d/%d): %v", retries+1, MaxRetries, err)
-		}
-	}
-
+	fd.client = fd.buildClient()
+	probeCtx, cancel := context.WithTimeout(fd.ctx, 30*time.Second)
+	defer cancel()
+	req, _ := http.NewRequestWithContext(probeCtx, "HEAD", fd.Url, nil)
+	fd.setHeaders(req)
+	resp, err := fd.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("HEAD request failed after %d retries: %w", MaxRetries, err)
+		return fmt.Errorf("probe resource: %w", err)
 	}
-	defer resp.Body.Close()
-
-	fd.TotalSize = resp.ContentLength
-	if fd.TotalSize <= 0 {
-		fd.IsMultiPart = false
+	resp.Body.Close()
+	if resp.StatusCode == 200 {
+		fd.TotalSize = resp.ContentLength
+		fd.validator = resp.Header.Get("ETag")
+		if strings.HasPrefix(fd.validator, "W/") {
+			fd.validator = ""
+		}
+		if fd.validator == "" {
+			fd.validator = resp.Header.Get("Last-Modified")
+		}
+		fd.IsMultiPart = resp.Header.Get("Accept-Ranges") == "bytes" && fd.TotalSize > MinPartSize
+	} else if resp.StatusCode == 405 || resp.StatusCode == 501 {
 		fd.TotalSize = -1
-	} else if resp.Header.Get("Accept-Ranges") == "bytes" && fd.TotalSize > MinPartSize {
-		fd.IsMultiPart = true
+	} else {
+		return fmt.Errorf("probe status: %d", resp.StatusCode)
 	}
-
-	dir := filepath.Dir(fd.FileName)
-	if err := os.MkdirAll(dir, os.ModePerm); err != nil {
-		return fmt.Errorf("create directory failed: %w", err)
+	fd.total.Store(fd.TotalSize)
+	if err := fd.ctx.Err(); err != nil {
+		return err
 	}
-
-	fd.FileName = shared.GetUniqueFileName(fd.FileName)
-
-	fd.File, err = os.OpenFile(fd.FileName, os.O_RDWR|os.O_CREATE, 0644)
-	if err != nil {
-		return fmt.Errorf("file open failed: %w", err)
+	if err := os.MkdirAll(filepath.Dir(fd.FileName), 0750); err != nil {
+		return err
 	}
-	if fd.TotalSize > 0 {
-		if err := fd.File.Truncate(fd.TotalSize); err != nil {
-			fd.File.Close()
-			return fmt.Errorf("file truncate failed: %w", err)
+	base, ext := strings.TrimSuffix(fd.FileName, filepath.Ext(fd.FileName)), filepath.Ext(fd.FileName)
+	for i := 0; ; i++ {
+		candidate := fd.FileName
+		if i > 0 {
+			candidate = fmt.Sprintf("%s(%d)%s", base, i, ext)
 		}
+		f, err := os.OpenFile(candidate, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+		if os.IsExist(err) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		fd.FileName = candidate
+		if err := f.Close(); err != nil {
+			os.Remove(candidate)
+			return err
+		}
+		break
 	}
+	fd.File, err = os.CreateTemp(filepath.Dir(fd.FileName), ".resd-*.part")
+	if err != nil {
+		os.Remove(fd.FileName)
+		return err
+	}
+	fd.tempName = fd.File.Name()
 	return nil
 }
-
 func (fd *FileDownloader) createDownloadTasks() {
+	fd.DownloadTaskList = nil
+	count := 1
 	if fd.IsMultiPart {
-		if fd.totalTasks <= 0 {
-			fd.totalTasks = 4
+		count = fd.totalTasks
+		if count < 1 {
+			count = 4
 		}
-		eachSize := fd.TotalSize / int64(fd.totalTasks)
-		if eachSize < MinPartSize {
-			fd.totalTasks = int(fd.TotalSize / MinPartSize)
-			if fd.totalTasks < 1 {
-				fd.totalTasks = 1
-			}
-			eachSize = fd.TotalSize / int64(fd.totalTasks)
+		if count > 64 {
+			count = 64
 		}
-
-		for i := 0; i < fd.totalTasks; i++ {
-			start := eachSize * int64(i)
-			end := eachSize*int64(i+1) - 1
-			if i == fd.totalTasks-1 {
-				end = fd.TotalSize - 1
-			}
-			fd.DownloadTaskList = append(fd.DownloadTaskList, &DownloadTask{
-				taskID:     i,
-				rangeStart: start,
-				rangeEnd:   end,
-			})
+		if max := int(fd.TotalSize / MinPartSize); count > max {
+			count = max
 		}
-	} else {
-		fd.totalTasks = 1
-		rangeEnd := int64(-1)
-		if fd.TotalSize > 0 {
-			rangeEnd = fd.TotalSize - 1
+	}
+	for i := 0; i < count; i++ {
+		start, end := int64(0), fd.TotalSize-1
+		if fd.IsMultiPart {
+			start = fd.TotalSize * int64(i) / int64(count)
+			end = fd.TotalSize*int64(i+1)/int64(count) - 1
 		}
-		fd.DownloadTaskList = append(fd.DownloadTaskList, &DownloadTask{
-			taskID:     0,
-			rangeStart: 0,
-			rangeEnd:   rangeEnd,
-		})
+		fd.DownloadTaskList = append(fd.DownloadTaskList, &DownloadTask{taskID: i, rangeStart: start, rangeEnd: end})
 	}
 }
-
 func (fd *FileDownloader) startDownload() error {
-	wg := &sync.WaitGroup{}
-	progressChan := make(chan ProgressChan, len(fd.DownloadTaskList))
-	errorChan := make(chan error, len(fd.DownloadTaskList))
-
+	var wg sync.WaitGroup
+	errs := make(chan error, len(fd.DownloadTaskList))
 	for _, task := range fd.DownloadTaskList {
 		wg.Add(1)
-		go fd.startDownloadTask(wg, progressChan, errorChan, task)
-	}
-
-	go func() {
-		taskProgress := make([]int64, len(fd.DownloadTaskList))
-		totalDownloaded := int64(0)
-
-		for progress := range progressChan {
-			taskProgress[progress.taskID] += progress.bytes
-			totalDownloaded += progress.bytes
-
-			if fd.progressCallback != nil {
-				taskPercentage := float64(0)
-				if task := fd.DownloadTaskList[progress.taskID]; task != nil {
-					taskSize := task.rangeEnd - task.rangeStart + 1
-					if taskSize > 0 {
-						taskPercentage = float64(taskProgress[progress.taskID]) / float64(taskSize) * 100
+		go func(task *DownloadTask) {
+			defer wg.Done()
+			var err error
+			for attempt := 0; attempt < MaxRetries; attempt++ {
+				err = fd.doDownloadTask(task)
+				if err == nil || fd.ctx.Err() != nil {
+					break
+				}
+				if attempt < MaxRetries-1 {
+					select {
+					case <-fd.ctx.Done():
+						err = fd.ctx.Err()
+					case <-time.After(RetryDelay):
 					}
 				}
-				fd.progressCallback(float64(totalDownloaded), float64(fd.TotalSize), progress.taskID, taskPercentage)
 			}
-		}
-	}()
-
-	go func() {
-		wg.Wait()
-		close(progressChan)
-		close(errorChan)
-	}()
-
-	var errArr []error
-	for err := range errorChan {
-		errArr = append(errArr, err)
+			if err != nil {
+				errs <- err
+			}
+		}(task)
 	}
-
-	if len(errArr) > 0 {
-		if !fd.RetryOnError && fd.IsMultiPart {
-			// 降级
-			fd.RetryOnError = true
-			fd.DownloadTaskList = []*DownloadTask{}
-			fd.totalTasks = 1
-			fd.IsMultiPart = false
-			fd.createDownloadTasks()
-			return fd.startDownload()
-		}
-		return fmt.Errorf("download failed with %d errors: %v", len(errArr), errArr[0])
-	}
-
-	if err := fd.verifyDownload(); err != nil {
+	wg.Wait()
+	close(errs)
+	for err := range errs {
 		return err
 	}
-
-	return nil
+	return fd.verifyDownload()
 }
-
-func (fd *FileDownloader) startDownloadTask(wg *sync.WaitGroup, progressChan chan ProgressChan, errorChan chan error, task *DownloadTask) {
-	defer wg.Done()
-
-	for retries := 0; retries < MaxRetries; retries++ {
-		err := fd.doDownloadTask(progressChan, task)
-		if err == nil {
-			task.isCompleted = true
-			return
-		}
-
-		if strings.Contains(err.Error(), "cancelled") {
-			errorChan <- err
-			return
-		}
-
-		task.err = err
-		globalLogger.Warn().Msgf("Task %d failed (attempt %d/%d): %v", task.taskID, retries+1, MaxRetries, err)
-
-		if retries < MaxRetries-1 {
-			select {
-			case <-fd.ctx.Done():
-				errorChan <- fmt.Errorf("task %d cancelled during retry", task.taskID)
-				return
-			case <-time.After(RetryDelay):
-			}
+func (fd *FileDownloader) doDownloadTask(task *DownloadTask) error {
+	if err := fd.ctx.Err(); err != nil {
+		return err
+	}
+	if !fd.IsMultiPart {
+		fd.downloaded.Add(-task.downloadedSize)
+		task.downloadedSize = 0
+		if err := fd.File.Truncate(0); err != nil {
+			return err
 		}
 	}
-
-	errorChan <- fmt.Errorf("task %d failed after %d attempts: %v", task.taskID, MaxRetries, task.err)
-}
-
-func (fd *FileDownloader) doDownloadTask(progressChan chan ProgressChan, task *DownloadTask) error {
-	select {
-	case <-fd.ctx.Done():
-		return fmt.Errorf("download cancelled")
-	default:
+	if fd.IsMultiPart && task.downloadedSize == task.rangeEnd-task.rangeStart+1 {
+		return nil
 	}
-
-	request, err := http.NewRequestWithContext(fd.ctx, "GET", fd.Url, nil)
+	req, err := http.NewRequestWithContext(fd.ctx, "GET", fd.Url, nil)
 	if err != nil {
-		return fmt.Errorf("create request failed: %w", err)
+		return err
 	}
-	fd.setHeaders(request)
-
+	fd.setHeaders(req)
+	start := task.rangeStart + task.downloadedSize
 	if fd.IsMultiPart {
-		rangeStart := task.rangeStart + task.downloadedSize
-		rangeHeader := fmt.Sprintf("bytes=%d-%d", rangeStart, task.rangeEnd)
-		request.Header.Set("Range", rangeHeader)
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", start, task.rangeEnd))
+		if fd.validator != "" {
+			req.Header.Set("If-Range", fd.validator)
+		}
 	}
-
-	client := fd.buildClient()
-	resp, err := client.Do(request)
+	resp, err := fd.client.Do(req)
 	if err != nil {
-		return fmt.Errorf("send request failed: %w", err)
+		return err
 	}
 	defer resp.Body.Close()
-
-	if fd.IsMultiPart && resp.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("server does not support range requests, status: %d", resp.StatusCode)
-	} else if !fd.IsMultiPart && resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+	if fd.IsMultiPart {
+		var a, b, total int64
+		if resp.StatusCode != 206 {
+			return fmt.Errorf("range status: %d", resp.StatusCode)
+		}
+		if _, err := fmt.Sscanf(resp.Header.Get("Content-Range"), "bytes %d-%d/%d", &a, &b, &total); err != nil || a != start || b != task.rangeEnd || total != fd.TotalSize {
+			return errors.New("invalid Content-Range")
+		}
+	} else {
+		if resp.StatusCode != 200 {
+			return fmt.Errorf("download status: %d", resp.StatusCode)
+		}
+		if fd.TotalSize < 0 && resp.ContentLength >= 0 {
+			fd.TotalSize = resp.ContentLength
+			fd.total.Store(fd.TotalSize)
+			task.rangeEnd = fd.TotalSize - 1
+		}
 	}
-
+	// A stalled body is closed without limiting the duration of a healthy large download.
+	bodyCtx, bodyCancel := context.WithCancel(fd.ctx)
+	defer bodyCancel()
+	var lastRead atomic.Int64
+	lastRead.Store(time.Now().UnixNano())
+	go func() {
+		ticker := time.NewTicker(time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-bodyCtx.Done():
+				return
+			case <-ticker.C:
+				if time.Since(time.Unix(0, lastRead.Load())) > 30*time.Second {
+					resp.Body.Close()
+					return
+				}
+			}
+		}
+	}()
 	buf := make([]byte, 32*1024)
 	for {
-		select {
-		case <-fd.ctx.Done():
-			return fmt.Errorf("download cancelled")
-		default:
-		}
-
-		n, err := resp.Body.Read(buf)
+		n, readErr := resp.Body.Read(buf)
 		if n > 0 {
-			writeSize := int64(n)
-			offset := task.rangeStart + task.downloadedSize
-			_, writeErr := fd.File.WriteAt(buf[:writeSize], offset)
-			if writeErr != nil {
-				return fmt.Errorf("write file failed at offset %d: %w", offset, writeErr)
+			lastRead.Store(time.Now().UnixNano())
+			if fd.TotalSize >= 0 && task.downloadedSize+int64(n) > task.rangeEnd-task.rangeStart+1 {
+				return errors.New("response exceeds expected size")
 			}
-
-			task.downloadedSize += writeSize
-			progressChan <- ProgressChan{taskID: task.taskID, bytes: writeSize}
-
-			if fd.TotalSize > 0 && task.rangeStart+task.downloadedSize-1 >= task.rangeEnd {
-				return nil
+			written, err := fd.File.WriteAt(buf[:n], task.rangeStart+task.downloadedSize)
+			if err != nil {
+				return err
 			}
+			if written != n {
+				return io.ErrShortWrite
+			}
+			task.downloadedSize += int64(n)
+			fd.downloaded.Add(int64(n))
 		}
-
-		if err != nil {
-			if err == io.EOF {
-				return nil
+		if readErr != nil {
+			if readErr != io.EOF {
+				return readErr
 			}
-			return fmt.Errorf("read response failed: %w", err)
+			if fd.TotalSize >= 0 && task.downloadedSize != task.rangeEnd-task.rangeStart+1 {
+				return io.ErrUnexpectedEOF
+			}
+			return nil
+		}
+		if err := fd.ctx.Err(); err != nil {
+			return err
 		}
 	}
 }
-
 func (fd *FileDownloader) verifyDownload() error {
+	var total int64
 	for _, task := range fd.DownloadTaskList {
-		if !task.isCompleted {
-			return fmt.Errorf("task %d not completed", task.taskID)
+		if fd.TotalSize >= 0 && task.downloadedSize != task.rangeEnd-task.rangeStart+1 {
+			return io.ErrUnexpectedEOF
 		}
+		total += task.downloadedSize
 	}
-
-	if fd.TotalSize > 0 {
-		_, err := fd.File.Stat()
-		if err != nil {
-			return fmt.Errorf("get file info failed: %w", err)
-		}
-	}
-
-	return nil
-}
-
-func (fd *FileDownloader) Start() error {
-	if err := fd.init(); err != nil {
+	info, err := fd.File.Stat()
+	if err != nil {
 		return err
 	}
-	fd.createDownloadTasks()
-
-	err := fd.startDownload()
-
-	if fd.File != nil {
-		fd.File.Close()
+	if info.Size() != total || (fd.TotalSize >= 0 && total != fd.TotalSize) {
+		return errors.New("download size mismatch")
 	}
-
+	return nil
+}
+func (fd *FileDownloader) Start() (err error) {
+	defer fd.cancelFunc()
+	if err = fd.init(); err != nil {
+		if fd.client != nil {
+			fd.client.CloseIdleConnections()
+		}
+		return err
+	}
+	defer fd.client.CloseIdleConnections()
+	defer func() {
+		if fd.File != nil {
+			fd.File.Close()
+		}
+		if err != nil {
+			os.Remove(fd.tempName)
+			os.Remove(fd.FileName)
+		}
+	}()
+	fd.createDownloadTasks()
+	done := make(chan struct{})
+	var progressWG sync.WaitGroup
+	progressWG.Add(1)
+	go func() {
+		defer progressWG.Done()
+		ticker := time.NewTicker(200 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if fd.progressCallback != nil {
+					fd.progressCallback(float64(fd.downloaded.Load()), float64(fd.total.Load()), 0, 0)
+				}
+			}
+		}
+	}()
+	err = fd.startDownload()
+	if err != nil && fd.IsMultiPart && fd.ctx.Err() == nil {
+		fd.IsMultiPart = false
+		fd.downloaded.Store(0)
+		fd.createDownloadTasks()
+		err = fd.startDownload()
+	}
+	close(done)
+	progressWG.Wait()
+	if err != nil {
+		return err
+	}
+	if err = fd.ctx.Err(); err != nil {
+		return err
+	}
+	if err = fd.File.Sync(); err != nil {
+		return err
+	}
+	if err = fd.File.Close(); err != nil {
+		return err
+	}
+	fd.File = nil
+	err = os.Rename(fd.tempName, fd.FileName)
 	return err
 }
-
-func (fd *FileDownloader) Cancel() {
-	if fd.cancelFunc != nil {
-		fd.cancelFunc()
+func (fd *FileDownloader) Cancel() { fd.cancelFunc() }
+func progressMessage(downloaded, total float64) string {
+	if total <= 0 {
+		return strconv.FormatInt(int64(downloaded), 10) + " bytes"
 	}
-
-	if fd.File != nil {
-		fd.File.Close()
-	}
-
-	if fd.FileName != "" {
-		_ = os.Remove(fd.FileName)
-	}
+	return strconv.Itoa(int(downloaded*100/total)) + "%"
 }

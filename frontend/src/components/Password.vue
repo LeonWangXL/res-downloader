@@ -23,10 +23,7 @@
             class="w-full"
         />
       </div>
-      <div class="mt-3 text-base">
-        <label>{{ t("components.password_cache") }}</label>
-        <NSwitch class="pl-1" v-model:value="formValue.cache" :aria-placeholder="t('components.password_cache')"/>
-      </div>
+
     </div>
     <template #action>
       <n-button type="primary" @click="submit">{{ t("common.submit") }}</n-button>
@@ -58,6 +55,7 @@ const submit = () => {
     window.$message?.error(t("components.password_empty"))
     return
   }
-  emits('submit', formValue.password, formValue.cache)
+  emits('submit', formValue.password, false)
+  formValue.password=''
 }
 </script>

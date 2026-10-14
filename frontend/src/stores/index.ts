@@ -17,7 +17,7 @@ export const useIndexStore = defineStore("index-store", () => {
     const globalConfig = ref<appType.Config>({
         Theme: "lightTheme",
         Locale: "zh",
-        Host: "0.0.0.0",
+        Host: "127.0.0.1",
         Port: "8899",
         Quality: 0,
         SaveDirectory: "",
@@ -47,26 +47,33 @@ export const useIndexStore = defineStore("index-store", () => {
     const baseUrl = ref("")
 
     const init = async () => {
-        Environment().then((res) => {
+        await Environment().then((res) => {
             envInfo.value = res
         })
 
         await bind.AppInfo().then((res: core.ResponseData)=>{
             appInfo.value = Object.assign({}, appInfo.value, res.data)
             isProxy.value = res.data.IsProxy
+            window.$sessionToken=res.data.SessionToken
+            const host=res.data.Host==='::1' ? '[::1]' : '127.0.0.1'
+            baseUrl.value=`http://${host}:${res.data.Port}`
+            window.$baseUrl=baseUrl.value
+            if(res.data.StartupError) throw new Error(res.data.StartupError)
         })
 
         await bind.Config().then((res: core.ResponseData)=>{
             globalConfig.value = Object.assign({}, globalConfig.value, res.data)
         })
 
-        baseUrl.value = "http://127.0.0.1:" +globalConfig.value.Port
-        window.$baseUrl = baseUrl.value
+
     }
 
-    const setConfig = (formValue: Object) => {
-        globalConfig.value = Object.assign({}, globalConfig.value, formValue)
-        appApi.setConfig(globalConfig.value)
+    const setConfig = async (formValue: Object) => {
+        const next=Object.assign({},globalConfig.value,formValue)
+        const res=await appApi.setConfig(next)
+        if(res.code===0) throw new Error(res.message)
+        globalConfig.value=next
+        return res
     }
 
     const openProxy = async () => {

@@ -77,7 +77,9 @@ func (p *DefaultPlugin) OnResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *
 			res.OtherData["headers"] = string(headers)
 		}
 
-		p.bridge.MarkMedia(urlSign)
+		if !p.bridge.MarkMedia(urlSign) {
+			return resp
+		}
 		go func(res shared.MediaInfo) {
 			p.bridge.Send("newResources", res)
 		}(res)

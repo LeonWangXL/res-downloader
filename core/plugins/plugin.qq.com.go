@@ -2,7 +2,10 @@ package plugins
 
 import (
 	"bytes"
+	"compress/gzip"
+	"compress/zlib"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/elazarl/goproxy"
 	gonanoid "github.com/matoous/go-nanoid/v2"
@@ -40,6 +43,9 @@ func (p *QqPlugin) OnRequest(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Requ
 		}
 	}
 
+	if strings.HasSuffix(r.URL.Hostname(), "res.wx.qq.com") || strings.HasSuffix(r.URL.Hostname(), "channels.weixin.qq.com") {
+		r.Header.Set("Accept-Encoding", "identity")
+	}
 	return nil, nil
 }
 
@@ -48,7 +54,7 @@ func (p *QqPlugin) OnResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *http.
 		return nil
 	}
 
-	host := resp.Request.Host
+	host := resp.Request.URL.Hostname()
 	Path := resp.Request.URL.Path
 
 	classify, _ := p.bridge.TypeSuffix(resp.Header.Get("Content-Type"))
@@ -73,7 +79,7 @@ func (p *QqPlugin) OnResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *http.
 		}
 
 		if strings.Contains(Path, "web/web-finder/res/js/virtual_svg-icons-register.publish") {
-			body, err := io.ReadAll(respTemp.Body)
+			body, err := readRewriteBody(respTemp)
 			if err != nil {
 				return respTemp
 			}
@@ -120,8 +126,8 @@ func (p *QqPlugin) OnResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *http.
 }
 
 func (p *QqPlugin) handleWechatRequest(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
+	body, err := io.ReadAll(io.LimitReader(r.Body, 2*1024*1024+1))
+	if err != nil || len(body) > 2*1024*1024 {
 		return r, p.buildEmptyResponse(r)
 	}
 
@@ -232,7 +238,9 @@ func (p *QqPlugin) handleMedia(body []byte) {
 		res.OtherData["wx_file_formats"] = strings.Join(fileFormats, "#")
 	}
 
-	p.bridge.MarkMedia(urlSign)
+	if !p.bridge.MarkMedia(urlSign) {
+		return
+	}
 
 	go func(res shared.MediaInfo) {
 		p.bridge.Send("newResources", res)
@@ -254,7 +262,7 @@ func (p *QqPlugin) buildEmptyResponse(r *http.Request) *http.Response {
 }
 
 func (p *QqPlugin) replaceWxJsContent(resp *http.Response, old, new string) *http.Response {
-	body, err := io.ReadAll(resp.Body)
+	body, err := readRewriteBody(resp)
 	if err != nil {
 		return resp
 	}
@@ -270,3 +278,53 @@ func (p *QqPlugin) replaceWxJsContent(resp *http.Response, old, new string) *htt
 func (p *QqPlugin) v() string {
 	return p.bridge.GetVersion()
 }
+
+func readRewriteBody(resp *http.Response) ([]byte, error) {
+	original := resp.Body
+	raw, err := io.ReadAll(io.LimitReader(original, 8*1024*1024+1))
+	// Preserve the response on a read/decode failure or when the rewrite limit is exceeded.
+	resp.Body = &replayBody{Reader: io.MultiReader(bytes.NewReader(raw), original), closer: original}
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) > 8*1024*1024 {
+		return nil, errors.New("script rewrite limit exceeded")
+	}
+	var reader io.Reader = bytes.NewReader(raw)
+	var decoded io.ReadCloser
+	switch strings.ToLower(resp.Header.Get("Content-Encoding")) {
+	case "", "identity":
+	case "gzip":
+		decoded, err = gzip.NewReader(reader)
+	case "deflate":
+		decoded, err = zlib.NewReader(reader)
+	default:
+		return nil, errors.New("unsupported script encoding")
+	}
+	if err != nil {
+		return nil, err
+	}
+	if decoded != nil {
+		defer decoded.Close()
+		reader = decoded
+	}
+	body, err := io.ReadAll(io.LimitReader(reader, 8*1024*1024+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(body) > 8*1024*1024 {
+		return nil, errors.New("decoded script limit exceeded")
+	}
+	original.Close()
+	resp.Header.Del("Content-Encoding")
+	resp.Header.Del("ETag")
+	resp.Header.Del("Content-MD5")
+	return body, nil
+}
+
+type replayBody struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (r *replayBody) Close() error { return r.closer.Close() }
