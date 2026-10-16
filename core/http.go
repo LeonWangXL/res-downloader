@@ -57,7 +57,7 @@ func (h *HttpServer) start() error {
 		}
 		return nil, nil
 	}
-	h.server = &http.Server{ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	h.server = &http.Server{ConnContext: sourceConnectionContext, ReadHeaderTimeout: 10 * time.Second, IdleTimeout: 60 * time.Second, Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		host, port, err := net.SplitHostPort(r.Host)
 		isLocal := err == nil && port == h.Port && (host == "localhost" || net.ParseIP(host).IsLoopback())
 		if isLocal && HandleApi(w, r) {

@@ -41,6 +41,8 @@ export namespace appType {
         CoverUrl: string
         Size: number
         Domain: string
+        SourceApp?: string
+        SourcePID?: number
         Classify: string
         Suffix: string
         SavePath: string

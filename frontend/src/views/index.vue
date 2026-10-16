@@ -28,7 +28,7 @@
           </div>
         </div>
         <div ref="tableRegion" class="table-region">
-          <NDataTable class="resource-table" :columns="columns" :data="filteredData" :bordered="false" :max-height="tableHeight" :row-key="rowKey" :row-props="rowProps" :virtual-scroll="true" :header-height="50" :height-for-row="() => 72" :checked-row-keys="checkedRowKeysValue" :scroll-x="1050" @update:filters="updateColumnFilters" @update:checked-row-keys="handleCheck">
+          <NDataTable class="resource-table" :columns="columns" :data="filteredData" :bordered="false" :max-height="tableHeight" :row-key="rowKey" :row-props="rowProps" :virtual-scroll="true" :header-height="50" :height-for-row="() => 72" :checked-row-keys="checkedRowKeysValue" :scroll-x="1200" @update:filters="updateColumnFilters" @update:checked-row-keys="handleCheck">
             <template #empty><div class="resource-empty"><NIcon :component="ScanOutline" /><h3>{{ t(data.length ? 'workspace.no_matches' : 'workspace.empty_title') }}</h3><p v-if="!data.length">{{ t('workspace.empty_hint') }}</p><NButton v-if="data.length" @click="resetSearch">{{ t('workspace.reset_search') }}</NButton></div></template>
           </NDataTable>
         </div>
@@ -66,7 +66,7 @@ import {useI18n} from 'vue-i18n'
 import {useDialog} from 'naive-ui'
 import {DialogOptions} from 'naive-ui/es/dialog/src/DialogProvider'
 import {formatSize} from '@/func'
-import {safeResource, restoreResources} from '@/resourceCache'
+import {safeResource, restoreResources, dedupeResources} from '@/resourceCache'
 import {canDownload, isActiveTask} from '@/resourcePresentation'
 // @ts-ignore
 import {getDecryptionArray} from '@/assets/js/decrypt.js'
@@ -154,6 +154,12 @@ const columns = computed<DataTableColumns<appType.MediaInfo>>(() => [
     ]),
   },
   {title: t('index.domain'), key: 'Domain', width: 130, ellipsis: {tooltip: true}, ...textFilter('Domain')},
+  {title: t('workspace.source_app'), key: 'SourceApp', width: 150, ellipsis: {tooltip: true},
+    filterOptions: Array.from(new Set(data.value.map(row => row.SourceApp || ''))).sort().map(value => ({label: value || t('workspace.source_unknown'), value})),
+    filterOptionValues: columnFilters.value.SourceApp as string[] | null || null,
+    filter: (value, row) => (row.SourceApp || '') === value,
+    render: row => h(NTooltip, null, {trigger: () => h('span', row.SourceApp || t('workspace.source_unknown')), default: () => `${t('workspace.source_app_hint')}${row.SourcePID ? ` · PID ${row.SourcePID}` : ''}`}),
+  },
   {title: t('index.type'), key: 'Classify', width: 100, filterOptions: classify.value.slice(1).map(item => ({label: typeLabel(item.value), value: item.value})), filterOptionValues: columnFilters.value.Classify as string[] | null || null, filter: (value, row) => row.Classify === value, render: row => typeLabel(row.Classify)},
   {title: t('workspace.size_column'), key: 'Size', width: 118, filterOptions: [{label: '< 10 MB', value: 'small'}, {label: '10–100 MB', value: 'medium'}, {label: '≥ 100 MB', value: 'large'}], filterOptionValues: columnFilters.value.Size as string[] | null || null, filter: (value, row) => value === 'small' ? row.Size < 10 * 1024 * 1024 : value === 'medium' ? row.Size >= 10 * 1024 * 1024 && row.Size < 100 * 1024 * 1024 : row.Size >= 100 * 1024 * 1024, sorter: (a: appType.MediaInfo, b: appType.MediaInfo) => a.Size - b.Size, render: (row: appType.MediaInfo) => h('span', {class: 'resource-size'}, formatSize(row.Size))},
   {title: t('index.status'), key: 'Status', width: 132, filterOptions: ['ready','pending','running','done','error'].map(value => ({label: t(`index.${value}`), value})), filterOptionValues: columnFilters.value.Status as string[] | null || null, filter: (value, row) => row.Status === value, render: (row: appType.MediaInfo) => h(ResourceStatus, {row})},
@@ -232,7 +238,20 @@ onMounted(() => {
     }
   })
 
-  appApi.tasks().then((res:appType.Res)=>{if(res.code===1 && Array.isArray(res.data)){for(const active of res.data){const existing=data.value.find(item=>item.Id===active.Id);if(existing)Object.assign(existing,active);else data.value.push(active)}}}).catch(console.error)
+  appApi.tasks().then((res:appType.Res)=>{
+    if(res.code===1 && Array.isArray(res.data)){
+      for(const active of res.data){
+        const existing=data.value.find(item=>item.Id===active.Id || item.Url===active.Url)
+        if(existing){
+          if(selectedId.value===existing.Id)selectedId.value=active.Id
+          checkedRowKeysValue.value=checkedRowKeysValue.value.map(id=>id===existing.Id?active.Id:id)
+          Object.assign(existing,active)
+        } else data.value.push(active)
+      }
+      data.value=dedupeResources(data.value)
+      cacheData()
+    }
+  }).catch(console.error)
   nextTick(() => {
     resetTableHeight()
     if(tableRegion.value){resizeObserver = new ResizeObserver(resetTableHeight); resizeObserver.observe(tableRegion.value)}
@@ -241,7 +260,18 @@ onMounted(() => {
   eventStore.addHandle({
     type: "newResources",
     event: (res: appType.MediaInfo) => {
-      if(data.value.some(item=>item.Id===res.Id || item.UrlSign===res.UrlSign))return
+      const existing=data.value.find(item=>item.Id===res.Id || item.Url===res.Url)
+      if(existing){
+        // Refresh expiring headers/decryption metadata without replacing the visible task.
+        Object.assign(existing,res,{
+          Id:existing.Id,Status:existing.Status,SavePath:existing.SavePath,Message:existing.Message,
+          Description:res.Description || existing.Description,DecodeKey:res.DecodeKey || existing.DecodeKey,
+          SourceApp:existing.SourceApp || res.SourceApp,SourcePID:existing.SourcePID || res.SourcePID,
+          OtherData:{...existing.OtherData,...res.OtherData},
+        })
+        cacheData()
+        return
+      }
       if (store.globalConfig.InsertTail) {
         data.value.push(res)
       } else {
@@ -568,7 +598,8 @@ const handleImport = (content: string) => {
     }
   })
   if (newItems.length > 0) {
-    data.value = [...newItems, ...data.value]
+    // Keep existing IDs, download paths and in-progress tasks on repeated imports.
+    data.value = dedupeResources([...data.value, ...newItems])
     cacheData()
   }
   showImport.value = false

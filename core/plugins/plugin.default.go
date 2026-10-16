@@ -56,6 +56,8 @@ func (p *DefaultPlugin) OnResponse(resp *http.Response, ctx *goproxy.ProxyCtx) *
 			id = urlSign
 		}
 		res := shared.MediaInfo{
+			SourceApp:   shared.RequestApplication(resp.Request).Name,
+			SourcePID:   shared.RequestApplication(resp.Request).PID,
 			Id:          id,
 			Url:         rawUrl,
 			UrlSign:     urlSign,

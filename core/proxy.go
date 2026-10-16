@@ -80,6 +80,7 @@ func (p *Proxy) Startup() {
 	p.setTransport()
 	//p.Proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
 	p.Proxy.OnRequest().HandleConnectFunc(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
+		ctx.UserData = shared.RequestApplication(ctx.Req)
 		if ruleOnce.shouldMitm(host) {
 			return goproxy.MitmConnect, host
 		}
@@ -142,6 +143,10 @@ func (p *Proxy) matchPlugin(host string) shared.Plugin {
 }
 
 func (p *Proxy) httpRequestEvent(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
+	if source, ok := ctx.UserData.(shared.ApplicationInfo); ok {
+		r = r.WithContext(shared.WithApplication(r.Context(), source))
+		ctx.Req = r
+	}
 	plugin := p.matchPlugin(r.Host)
 	if plugin != nil {
 		newReq, newResp := plugin.OnRequest(r, ctx)

@@ -24,6 +24,7 @@
       </div>
       <dl class="resource-metadata">
         <dt>{{ t('workspace.source') }}</dt><dd>{{ row.Domain || '—' }}</dd>
+        <dt>{{ t('workspace.source_app') }}</dt><dd :title="t('workspace.source_app_hint')">{{ row.SourceApp || t('workspace.source_unknown') }}<span v-if="row.SourcePID"> · PID {{ row.SourcePID }}</span></dd>
         <dt>{{ t('index.type') }}</dt><dd>{{ typeLabel }}</dd>
         <dt>{{ t('index.resource_size') }}</dt><dd>{{ formatSize(row.Size) }}</dd>
         <dt>{{ t('index.status') }}</dt><dd><ResourceStatus :row="row" /></dd>

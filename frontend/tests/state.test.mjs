@@ -8,7 +8,7 @@ async function loadModule(path){
  return import(`data:text/javascript;base64,${Buffer.from(outputText).toString('base64')}`)
 }
 const {shouldAttachSessionToken}=await loadModule('../src/api/session.ts')
-const {safeResource,restoreResources}=await loadModule('../src/resourceCache.ts')
+const {safeResource,restoreResources,dedupeResources}=await loadModule('../src/resourceCache.ts')
 test('session token stays on the local API origin',()=>{
  const base='http://127.0.0.1:8899'
  assert.equal(shouldAttachSessionToken('/api/download',base),true)
@@ -27,6 +27,37 @@ test('damaged history is recoverable and interrupted tasks do not stay running',
  assert.deepEqual(restoreResources('broken'),[]);assert.deepEqual(restoreResources('{}'),[])
  const restored=restoreResources(JSON.stringify([{Id:'one',Url:'http://example/file',Status:'running',SavePath:'12%'}]))
  assert.equal(restored[0].Status,'ready');assert.equal(restored[0].SavePath,'')
+})
+
+test('application attribution survives resource persistence and legacy history stays unknown',()=>{
+ const row={Id:'app-one',Url:'https://example/file',SourceApp:'WeChat.exe',SourcePID:1234,Status:'ready'}
+ const restored=restoreResources(JSON.stringify([safeResource(row)]))
+ assert.equal(restored[0].SourceApp,'WeChat.exe');assert.equal(restored[0].SourcePID,1234)
+ const legacy=restoreResources(JSON.stringify([{Id:'legacy',Url:'https://example/old'}]))
+ assert.equal(legacy[0].SourceApp,undefined)
+})
+
+test('URL deduplication keeps active tasks and completed paths across repeated imports',()=>{
+ const url='https://example/video.mp4?token=a%2Bb&signature=original'
+ const completed={Id:'done',Url:url,Status:'done',SavePath:'Downloads/video.mp4'}
+ const imported={Id:'imported',Url:url,Status:'ready',SavePath:''}
+ assert.deepEqual(dedupeResources([completed,imported,imported]),[completed])
+ const active={Id:'active',Url:url,Status:'running',Message:'40%'}
+ assert.deepEqual(dedupeResources([imported,completed,active]),[active])
+ assert.equal(imported.Status,'ready')
+ const other={Id:'different-signature',Url:url+'&quality=high',Status:'ready'}
+ assert.deepEqual(dedupeResources([imported,other]),[imported,other])
+ assert.deepEqual(dedupeResources([{Id:'a',Url:'https://example/a'},{Id:'b',Url:'https://example/b'}]).map(row=>row.Id),['a','b'])
+})
+
+test('duplicate history is repaired without losing a completed download',()=>{
+ const restored=restoreResources(JSON.stringify([
+  {Id:'first',Url:'https://example/video',Status:'ready'},
+  {Id:'saved',Url:'https://example/video',Status:'done',SavePath:'Downloads/video.mp4'},
+  {Id:'second-url',Url:'https://example/video?token=second',Status:'ready'},
+ ]))
+ assert.equal(restored.length,2)
+ assert.equal(restored[0].Id,'saved');assert.equal(restored[0].SavePath,'Downloads/video.mp4')
 })
 
 const {previewURL,canDownload,canPreview,isActiveTask,encryptedPreviewSource,previewContentType}=await loadModule('../src/resourcePresentation.ts')

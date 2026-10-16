@@ -3,11 +3,14 @@ package core
 import (
 	"crypto/tls"
 	"crypto/x509"
+	"github.com/elazarl/goproxy"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"res-downloader/core/shared"
+	"runtime"
 	"testing"
 )
 
@@ -40,7 +43,16 @@ func TestProxyCapturesHTTPAndHTTPS(t *testing.T) {
 	originRoots := x509.NewCertPool()
 	originRoots.AddCert(secure.Certificate())
 	proxyOnce.Proxy.Tr.TLSClientConfig = &tls.Config{RootCAs: originRoots, MinVersion: tls.VersionTLS12}
-	proxy := httptest.NewServer(proxyOnce.Proxy)
+	sources := make(chan shared.ApplicationInfo, 2)
+	proxyOnce.Proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
+		if resp != nil {
+			sources <- shared.RequestApplication(resp.Request)
+		}
+		return resp
+	})
+	proxy := httptest.NewUnstartedServer(proxyOnce.Proxy)
+	proxy.Config.ConnContext = sourceConnectionContext
+	proxy.Start()
 	defer proxy.Close()
 	proxyURL, _ := url.Parse(proxy.URL)
 	roots := x509.NewCertPool()
@@ -60,6 +72,10 @@ func TestProxyCapturesHTTPAndHTTPS(t *testing.T) {
 		}
 		if !resourceOnce.mediaIsMarked(shared.Md5(rawURL)) {
 			t.Fatal("proxy did not capture resource", rawURL)
+		}
+		source := <-sources
+		if runtime.GOOS == "windows" && (source.PID != uint32(os.Getpid()) || source.Name == "") {
+			t.Fatalf("proxy lost application attribution for %s: %+v", rawURL, source)
 		}
 	}
 }

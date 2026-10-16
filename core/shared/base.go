@@ -7,6 +7,8 @@ type MediaInfo struct {
 	CoverUrl    string
 	Size        float64
 	Domain      string
+	SourceApp   string
+	SourcePID   uint32
 	Classify    string
 	Suffix      string
 	SavePath    string

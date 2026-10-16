@@ -131,12 +131,12 @@ func (p *QqPlugin) handleWechatRequest(r *http.Request, ctx *goproxy.ProxyCtx) (
 		return r, p.buildEmptyResponse(r)
 	}
 
-	go p.handleMedia(body)
+	go p.handleMedia(body, shared.RequestApplication(r))
 
 	return r, p.buildEmptyResponse(r)
 }
 
-func (p *QqPlugin) handleMedia(body []byte) {
+func (p *QqPlugin) handleMedia(body []byte, source shared.ApplicationInfo) {
 	var result map[string]interface{}
 	if err := json.Unmarshal(body, &result); err != nil {
 		return
@@ -156,6 +156,9 @@ func (p *QqPlugin) handleMedia(body []byte) {
 	if !ok || rawUrl == "" {
 		return
 	}
+	if urlToken, ok := firstMedia["urlToken"].(string); ok {
+		rawUrl += urlToken
+	}
 
 	urlSign := shared.Md5(rawUrl)
 	if p.bridge.MediaIsMarked(urlSign) {
@@ -168,6 +171,8 @@ func (p *QqPlugin) handleMedia(body []byte) {
 	}
 
 	res := shared.MediaInfo{
+		SourceApp:   source.Name,
+		SourcePID:   source.PID,
 		Id:          id,
 		Url:         rawUrl,
 		UrlSign:     urlSign,
@@ -199,10 +204,6 @@ func (p *QqPlugin) handleMedia(body []byte) {
 	isVideo, _ := p.bridge.GetResType("video")
 	if res.Classify == "video" && !isVideo && !isAll {
 		return
-	}
-
-	if urlToken, ok := firstMedia["urlToken"].(string); ok {
-		res.Url += urlToken
 	}
 
 	switch size := firstMedia["fileSize"].(type) {
